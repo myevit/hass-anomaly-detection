@@ -1,5 +1,3 @@
-# pip install influxdb-client holidays vowpalwabbit pandas numpy
-
 import os
 import pandas as pd
 import numpy as np
