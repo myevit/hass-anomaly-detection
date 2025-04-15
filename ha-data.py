@@ -20,11 +20,11 @@ BUCKET = "home-assistant"
 MODELS_DIR = "models"
 ANOMALY_MODEL_PATH = os.path.join(MODELS_DIR, "vw_anomaly_model.vw")
 META_MODEL_PATH = os.path.join(MODELS_DIR, "vw_meta_model.vw")
-MODEL_INFO_PATH = os.path.join(MODELS_DIR, "model_info.pkl")
+ANOMALY_HISTORY_PATH = os.path.join(MODELS_DIR, "anomaly_history.pkl")
 CHUNK_SIZE = "5min"
 DEFAULT_DAYS = 7  # Default number of days to look back
 ANOMALY_THRESHOLD = 0.7  # Threshold for anomaly detection
-HEURISTIC_ANOMALY_THRESHOLD = 0.8  # Threshold for testing anomaly detection if real anomaly score is 0. must be higher than ANOMALY_THRESHOLD
+HEURISTIC_ANOMALY_THRESHOLD = 0.0  # Threshold for testing anomaly detection if real anomaly score is 0. must be higher than ANOMALY_THRESHOLD
 FORCE_RETRAIN = True  # Set to True to force model retraining
 
 # --- Ensure model directory exists ---
@@ -41,21 +41,21 @@ if FORCE_RETRAIN:
         os.remove(ANOMALY_MODEL_PATH)
     if os.path.exists(META_MODEL_PATH):
         os.remove(META_MODEL_PATH)
-    if os.path.exists(MODEL_INFO_PATH):
-        os.remove(MODEL_INFO_PATH)
+    if os.path.exists(ANOMALY_HISTORY_PATH):
+        os.remove(ANOMALY_HISTORY_PATH)
     # Reset last_cutoff to ensure we get enough training data
     print(f"Resetting time range to last {DEFAULT_DAYS} days for retraining")
     # last_cutoff is already initialized above
 else:
     # Load existing model info if available
-    if os.path.exists(MODEL_INFO_PATH):
+    if os.path.exists(ANOMALY_HISTORY_PATH):
         try:
-            with open(MODEL_INFO_PATH, "rb") as f:
-                model_info = pickle.load(f)
-                last_cutoff = model_info.last_cutoff
-                change_history = model_info.change_history
+            with open(ANOMALY_HISTORY_PATH, "rb") as f:
+                anomaly_history = pickle.load(f)
+                last_cutoff = anomaly_history.last_cutoff
+                change_history = anomaly_history.change_history
         except Exception as e:
-            print(f"Error loading model info: {e}")
+            print(f"Error loading anomaly history: {e}")
 
 
 # --- Model Info Class ---
@@ -63,6 +63,164 @@ class ModelInfo:
     def __init__(self, last_cutoff, change_history=None):
         self.last_cutoff = last_cutoff
         self.change_history = change_history or []
+
+
+# Function definitions moved here
+def analyze_change_history(change_history, now):
+    """Analyze change history to detect patterns and frequencies"""
+    if not change_history:
+        return {
+            "entity_frequencies": {},
+            "hourly_patterns": {},
+            "daily_patterns": {},
+            "recommended_threshold": ANOMALY_THRESHOLD,
+            "recurring_sequences": [],
+        }
+
+    # 1. Entity frequency analysis
+    entity_frequencies = {}
+    for entry in change_history:
+        if "changes" not in entry:
+            continue
+        for entity in entry["changes"].keys():
+            entity_frequencies[entity] = entity_frequencies.get(entity, 0) + 1
+
+    # Sort by frequency
+    sorted_entities = sorted(
+        entity_frequencies.items(), key=lambda x: x[1], reverse=True
+    )
+
+    # 2. Temporal patterns (hourly and daily)
+    hourly_patterns = {hour: 0 for hour in range(24)}
+    daily_patterns = {day: 0 for day in range(7)}
+
+    for entry in change_history:
+        if "timestamp" not in entry:
+            continue
+        ts = entry["timestamp"]
+        hourly_patterns[ts.hour] += 1
+        daily_patterns[ts.dayofweek] += 1
+
+    # 3. Calculate recommended threshold based on historical data
+    scores = [entry.get("score", 0) for entry in change_history if "score" in entry]
+    if scores:
+        # Use 75th percentile of historical scores as recommended threshold
+        scores.sort()
+        percentile_75 = scores[int(len(scores) * 0.75)]
+        recommended_threshold = round(min(max(0.3, percentile_75), 0.9), 2)
+    else:
+        recommended_threshold = ANOMALY_THRESHOLD
+
+    # 4. Find recurring sequences (simplified pattern detection)
+    recurring_sequences = []
+    if len(change_history) > 5:
+        # Look at last 30 days of changes
+        cutoff = now - timedelta(days=30)
+        recent_changes = [
+            entry
+            for entry in change_history
+            if "timestamp" in entry and entry["timestamp"] > cutoff
+        ]
+
+        # Extract entities that changed together frequently
+        entity_groups = {}
+        for entry in recent_changes:
+            if "changes" not in entry:
+                continue
+
+            # Create a frozen set of changed entities for this timestamp
+            changed_entities = frozenset(entry["changes"].keys())
+            if len(changed_entities) > 1:
+                entity_groups[changed_entities] = (
+                    entity_groups.get(changed_entities, 0) + 1
+                )
+
+        # Find groups that occur more than once
+        for group, count in entity_groups.items():
+            if count > 1 and len(group) > 1:
+                recurring_sequences.append({"entities": list(group), "count": count})
+
+        # Sort by frequency
+        recurring_sequences.sort(key=lambda x: x["count"], reverse=True)
+        # Keep top 5
+        recurring_sequences = recurring_sequences[:5]
+
+    return {
+        "entity_frequencies": dict(sorted_entities[:10]),  # Top 10 entities
+        "hourly_patterns": hourly_patterns,
+        "daily_patterns": daily_patterns,
+        "recommended_threshold": recommended_threshold,
+        "recurring_sequences": recurring_sequences,
+    }
+
+
+def print_change_history_analysis(analysis):
+    """Print the analysis of change history in a readable format"""
+    print("\n=== ANOMALY HISTORY ANALYSIS ===")
+
+    # 1. Frequently anomalous entities
+    print("\n🔄 TOP ANOMALOUS ENTITIES:")
+    if analysis["entity_frequencies"]:
+        for entity, count in analysis["entity_frequencies"].items():
+            print(f"  • {entity}: {count} anomalies")
+    else:
+        print("  No entity frequency data available")
+
+    # 2. Time patterns
+    print("\n⏰ TEMPORAL PATTERNS:")
+    # Find peak hours
+    hourly = analysis["hourly_patterns"]
+    if sum(hourly.values()) > 0:
+        max_hourly = max(hourly.values())
+        peak_hours = [f"{h}:00" for h, v in hourly.items() if v > max_hourly * 0.7]
+        print(f"  • Peak anomaly hours: {', '.join(peak_hours)}")
+
+        # Find peak days
+        daily = analysis["daily_patterns"]
+        max_daily = max(daily.values())
+        days = [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+        ]
+        peak_days = [days[d] for d, v in daily.items() if v > max_daily * 0.7]
+        print(f"  • Peak anomaly days: {', '.join(peak_days)}")
+    else:
+        print("  No temporal pattern data available")
+
+    # 3. Threshold recommendation
+    current = ANOMALY_THRESHOLD
+    recommended = analysis["recommended_threshold"]
+    if current != recommended:
+        print(f"\n🎯 THRESHOLD RECOMMENDATION:")
+        if recommended > current:
+            print(f"  Current threshold ({current}) may be too low")
+            print(
+                f"  Recommended threshold: {recommended} (would reduce false positives)"
+            )
+        else:
+            print(f"  Current threshold ({current}) may be too high")
+            print(
+                f"  Recommended threshold: {recommended} (would catch more anomalies)"
+            )
+
+    # 4. Recurring sequences
+    sequences = analysis["recurring_sequences"]
+    if sequences:
+        print("\n🔁 RECURRING ANOMALY PATTERNS:")
+        for seq in sequences:
+            entities = seq["entities"]
+            if len(entities) > 3:
+                entity_str = f"{', '.join(entities[:2])} and {len(entities)-2} more"
+            else:
+                entity_str = ", ".join(entities)
+            print(f"  • {entity_str} changed together {seq['count']} times")
+
+    print("\n================================\n")
 
 
 # --- InfluxDB connection ---
@@ -534,15 +692,31 @@ if all_entity_changes:
     change_history.extend(all_entity_changes)
     # Limitation removed: now storing entire change history
 
+# Analyze change history for patterns and insights
+if change_history:
+    analysis_results = analyze_change_history(change_history, stop_time)
+    print_change_history_analysis(analysis_results)
+
+    # Optional: Auto-tune threshold based on history
+    AUTO_TUNE_THRESHOLD = False  # Set to True to enable auto-tuning
+    if AUTO_TUNE_THRESHOLD:
+        recommended = analysis_results["recommended_threshold"]
+        if (
+            abs(ANOMALY_THRESHOLD - recommended) > 0.1
+        ):  # Only change if difference is significant
+            print(f"Auto-tuning threshold: {ANOMALY_THRESHOLD} → {recommended}")
+            ANOMALY_THRESHOLD = recommended
+
 # Print model statistics to verify training has occurred
 print(
-    f"Anomaly model stats - Total examples processed: {round(anomaly_model.get_weighted_examples())}"
+    f"Anomaly model total examples processed: {round(anomaly_model.get_weighted_examples())}"
 )
 print(f"Anomaly model total loss: {round(anomaly_model.get_sum_loss())}")
 print(
-    f"Meta model stats - Total examples processed: {round(meta_model.get_weighted_examples())}"
+    f"Meta model total examples processed: {round(meta_model.get_weighted_examples())}"
 )
 print(f"Meta model total loss: {round(meta_model.get_sum_loss())}")
+print(f"Anomaly history: {len(change_history)} recorded changes")
 
 # Save models to files
 try:
@@ -560,12 +734,12 @@ except Exception as e:
     print(f"Error saving meta model: {e}")
 
 # Save model info separately (without the model objects)
-model_info = ModelInfo(stop_time, change_history)
+anomaly_history = ModelInfo(stop_time, change_history)
 try:
-    with open(MODEL_INFO_PATH, "wb") as f:
-        pickle.dump(model_info, f)
-    print(f"Model info saved to {MODEL_INFO_PATH}")
+    with open(ANOMALY_HISTORY_PATH, "wb") as f:
+        pickle.dump(anomaly_history, f)
+    print(f"Anomaly history saved to {ANOMALY_HISTORY_PATH}")
 except Exception as e:
-    print(f"Error saving model info: {e}")
+    print(f"Error saving anomaly history: {e}")
 
 print("Models updated and saved.")
