@@ -1,0 +1,26 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+Context-Aware Anomaly Detection for Smart Homes ￼
+
+Description:
+
+This project aims to develop an intelligent anomaly detection system tailored for smart home environments. By leveraging historical data from Home Assistant, the system will learn typical household behaviors and identify deviations that may indicate anomalies.
+
+Key Features:
+	•	Contextual Analysis: The system considers various contextual factors such as time of day, day of the week, seasonal variations, and weather conditions to understand normal behavior patterns.
+	•	Data Processing: Utilizes time-series data from Home Assistant, including sensor readings and device states, to build a comprehensive understanding of household activities.
+	•	Anomaly Detection: Employs machine learning techniques to detect unusual patterns or behaviors that deviate from the established norms, taking into account the contextual information.
+	•	Adaptive Learning: The model continuously learns and adapts to changes in household routines, improving its accuracy over time.
+
+Technical Stack:
+	•	Data Collection: Home Assistant for smart home data aggregation. ￼
+	•	Data Storage: InfluxDB for efficient time-series data storage.
+	•	Data Processing: Python for data manipulation and preprocessing.
+	•	Machine Learning: for implementing anomaly detection algorithms. ￼
+
+Objective:
+
+To enhance smart home security and efficiency by detecting anomalies in household behaviors through context-aware analysis, enabling proactive responses to potential issues. ￼
