@@ -1,3 +1,5 @@
+# pip install influxdb-client holidays vowpalwabbit pandas numpy
+
 import os
 import pandas as pd
 import numpy as np
@@ -8,6 +10,7 @@ import pickle
 import holidays
 import warnings
 from influxdb_client.client.warnings import MissingPivotFunction
+import pytz
 
 # --- CONFIG ---
 INFLUX_URL = "http://192.168.1.4:8086"
@@ -15,20 +18,49 @@ TOKEN = "LY86Tqy1cg5-UYTYPMmHI5opIxC2_NtLiZexyHehiqmL7YLGyHOyEeosm9JXAnoVuNaZT5T
 ORG = "myeHome"
 BUCKET = "home-assistant"
 MODELS_DIR = "models"
-ANOMALY_MODEL_PATH = os.path.join(MODELS_DIR, "vw_anomaly_model.pkl")
-META_MODEL_PATH = os.path.join(MODELS_DIR, "vw_meta_model.pkl")
+ANOMALY_MODEL_PATH = os.path.join(MODELS_DIR, "vw_anomaly_model.vw")
+META_MODEL_PATH = os.path.join(MODELS_DIR, "vw_meta_model.vw")
+MODEL_INFO_PATH = os.path.join(MODELS_DIR, "model_info.pkl")
 CHUNK_SIZE = "5min"
 DEFAULT_DAYS = 7  # Default number of days to look back
 ANOMALY_THRESHOLD = 0.7  # Threshold for anomaly detection
+HEURISTIC_ANOMALY_THRESHOLD = 0.8  # Threshold for testing anomaly detection if real anomaly score is 0. must be higher than ANOMALY_THRESHOLD
+FORCE_RETRAIN = True  # Set to True to force model retraining
 
 # --- Ensure model directory exists ---
 os.makedirs(MODELS_DIR, exist_ok=True)
 
+# Initialize last_cutoff and change_history
+last_cutoff = datetime.now(timezone.utc) - timedelta(days=DEFAULT_DAYS)
+change_history = []
 
-# --- Model Wrapper Class ---
-class VWModelWrapper:
-    def __init__(self, model, last_cutoff, change_history=None):
-        self.model = model
+# If force retrain is enabled, delete existing models
+if FORCE_RETRAIN:
+    print("Forcing model retraining - deleting existing models...")
+    if os.path.exists(ANOMALY_MODEL_PATH):
+        os.remove(ANOMALY_MODEL_PATH)
+    if os.path.exists(META_MODEL_PATH):
+        os.remove(META_MODEL_PATH)
+    if os.path.exists(MODEL_INFO_PATH):
+        os.remove(MODEL_INFO_PATH)
+    # Reset last_cutoff to ensure we get enough training data
+    print(f"Resetting time range to last {DEFAULT_DAYS} days for retraining")
+    # last_cutoff is already initialized above
+else:
+    # Load existing model info if available
+    if os.path.exists(MODEL_INFO_PATH):
+        try:
+            with open(MODEL_INFO_PATH, "rb") as f:
+                model_info = pickle.load(f)
+                last_cutoff = model_info.last_cutoff
+                change_history = model_info.change_history
+        except Exception as e:
+            print(f"Error loading model info: {e}")
+
+
+# --- Model Info Class ---
+class ModelInfo:
+    def __init__(self, last_cutoff, change_history=None):
         self.last_cutoff = last_cutoff
         self.change_history = change_history or []
 
@@ -42,6 +74,19 @@ warnings.simplefilter("ignore", MissingPivotFunction)
 
 
 # --- Helper Functions ---
+def clean_value(value):
+    """Clean a value to prevent newlines and other problematic characters"""
+    if isinstance(value, str):
+        # Replace newlines, tabs, etc with spaces
+        value = value.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+        # Replace multiple spaces with a single space
+        while "  " in value:
+            value = value.replace("  ", " ")
+        # Remove other problematic characters
+        value = value.replace("|", "_").replace(":", "_")
+    return value
+
+
 def format_vw_example(
     timestamp,
     numeric_features,
@@ -59,44 +104,56 @@ def format_vw_example(
     - label: optional label for training
     - tag: optional example tag
     """
-    example = ""
+    example_parts = []
 
     # Add label if provided (for anomaly detection, we use quantile regression)
     if label is not None:
-        example += f"{label} "
-
-    # Add importance weight if needed
-    # example += "1.0 "
+        example_parts.append(f"{label}")
 
     # Add tag if provided (for tracking examples)
     if tag:
-        example += f"'{tag} "
+        example_parts.append(f"'{tag}")
+
+    # Store namespace strings
+    ns_strings = []
 
     # Add numeric features namespace
     if numeric_features:
-        example += "|num "
+        num_parts = []
         for name, value in numeric_features.items():
             if pd.notna(value):
-                safe_name = name.replace(":", "_").replace("|", "_")
-                example += f"{safe_name}:{value} "
+                safe_name = clean_value(str(name))
+                num_parts.append(f"{safe_name}:{value}")
+        if num_parts:
+            ns_strings.append("|num " + " ".join(num_parts))
 
     # Add text features namespace - let VW handle tokenization
     if text_features:
-        example += "|txt "
+        txt_parts = []
         for name, value in text_features.items():
             if value and pd.notna(value) and value.lower() not in ["nan", "none", ""]:
-                safe_name = name.replace(":", "_").replace("|", "_")
-                example += f"{safe_name}_{value} "
+                safe_name = clean_value(str(name))
+                safe_value = clean_value(str(value))
+                txt_parts.append(f"{safe_name}_{safe_value}")
+        if txt_parts:
+            ns_strings.append("|txt " + " ".join(txt_parts))
 
     # Add time context namespace
     if context_features:
-        example += "|ctx "
+        ctx_parts = []
         for name, value in context_features.items():
             if pd.notna(value):
-                safe_name = name.replace(":", "_").replace("|", "_")
-                example += f"{safe_name}:{value} "
+                safe_name = clean_value(str(name))
+                ctx_parts.append(f"{safe_name}:{value}")
+        if ctx_parts:
+            ns_strings.append("|ctx " + " ".join(ctx_parts))
 
-    return example
+    # Combine namespace strings
+    if ns_strings:
+        example_parts.extend(ns_strings)
+
+    # Join all parts with spaces
+    return " ".join(example_parts)
 
 
 def extract_timestamp_features(timestamp):
@@ -105,6 +162,8 @@ def extract_timestamp_features(timestamp):
 
     features = {
         "hour": timestamp.hour,
+        "hour_quarter": timestamp.minute
+        // 15,  # Adds 0, 1, 2, or 3 for quarter of hour
         "day_of_week": timestamp.dayofweek,
         "is_weekend": int(timestamp.dayofweek >= 5),
         "month": timestamp.month,
@@ -163,40 +222,61 @@ def track_changes(current_data, previous_data, entity_cols):
                             "current": str(current_val),
                         }
                 except Exception as e:
-                    print(f"⚠️ Error calculating change for {col}: {e}")
+                    print(f"Error calculating change for {col}: {e}")
 
     return changes
 
 
+def format_timestamp(ts):
+    """Convert timestamp to human-readable local time format"""
+
+    # Handle timezone-naive timestamps
+    if ts.tzinfo is None:
+        # Assume UTC if no timezone info
+        ts = ts.replace(tzinfo=timezone.utc)
+
+    # Convert to local timezone
+    local_timezone = datetime.now().astimezone().tzinfo
+    local_ts = ts.astimezone(local_timezone)
+
+    # Format: "dd.mm.yyyy hh:mm:ss"
+    return local_ts.strftime("%d.%m.%Y %H:%M:%S")
+
+
 # --- Load or create models ---
-def create_anomaly_model():
+def create_anomaly_model(save_path=None):
     """Create a VW model for anomaly detection using quantile regression"""
-    args = "--quiet --loss_function quantile --quantile_tau 0.95 --ngram txt:3 --skips txt:1 --bit_precision 28 --adaptive --normalized"
+    args = "--quiet --loss_function quantile --quantile_tau 0.9 --ngram txt:3 --skips txt:1 --bit_precision 28 --adaptive --normalized"
+    if save_path:
+        args += f" -f {save_path} --save_resume"
     return vowpalwabbit.Workspace(args)
 
 
-def create_meta_model():
+def create_meta_model(save_path=None):
     """Create a VW model for meta decisions using binary classification"""
     args = "--quiet --loss_function logistic --binary --ngram txt:2 --bit_precision 28"
+    if save_path:
+        args += f" -f {save_path} --save_resume"
     return vowpalwabbit.Workspace(args)
 
 
-# Load existing models or create new ones
+# Create or load anomaly model
 if os.path.exists(ANOMALY_MODEL_PATH):
-    with open(ANOMALY_MODEL_PATH, "rb") as f:
-        anomaly_wrapper = pickle.load(f)
-        anomaly_model = anomaly_wrapper.model
-        last_cutoff = anomaly_wrapper.last_cutoff
-        change_history = anomaly_wrapper.change_history
+    try:
+        anomaly_model = vowpalwabbit.Workspace(f"--quiet -i {ANOMALY_MODEL_PATH}")
+    except Exception as e:
+        print(f"Error loading anomaly model: {e}")
+        anomaly_model = create_anomaly_model()
 else:
     anomaly_model = create_anomaly_model()
-    last_cutoff = datetime.now(timezone.utc) - timedelta(days=DEFAULT_DAYS)
-    change_history = []
 
+# Create or load meta model
 if os.path.exists(META_MODEL_PATH):
-    with open(META_MODEL_PATH, "rb") as f:
-        meta_wrapper = pickle.load(f)
-        meta_model = meta_wrapper.model
+    try:
+        meta_model = vowpalwabbit.Workspace(f"--quiet -i {META_MODEL_PATH}")
+    except Exception as e:
+        print(f"Error loading meta model: {e}")
+        meta_model = create_meta_model()
 else:
     meta_model = create_meta_model()
 
@@ -217,14 +297,25 @@ if not latest_df.empty:
     latest_time = pd.to_datetime(latest_df["_time"].iloc[0])
     if latest_time > last_cutoff:
         last_cutoff = latest_time
-        print(f"📅 Adjusted start time to latest InfluxDB record: {last_cutoff}")
+        print(
+            f"Adjusted start time to latest InfluxDB record: {format_timestamp(last_cutoff)}"
+        )
 
 # Set up query time range
 now = datetime.now(timezone.utc)
 start = last_cutoff.replace(microsecond=0).isoformat()
 stop_time = now.replace(microsecond=0)
 stop = stop_time.isoformat()
-print(f"⏱️ Querying from {start} to {stop}...")
+print(f"Querying from {format_timestamp(last_cutoff)} to {format_timestamp(now)}...")
+
+# After setting up query time range
+time_difference = now - last_cutoff
+if time_difference.total_seconds() < 300:  # 300 seconds = 5 minutes
+    print(
+        f"Only {round(time_difference.total_seconds())} seconds since last update. Need at least 300 seconds (5 minutes) for a complete chunk."
+    )
+    print("Skipping model update to avoid processing incomplete chunks.")
+    exit()
 
 # --- Query InfluxDB ---
 query = f"""
@@ -243,10 +334,10 @@ from(bucket: "{BUCKET}")
 df = query_api.query_data_frame(query)
 df = pd.concat(df) if isinstance(df, list) else df
 if df.empty:
-    print("⚠️ No new data found.")
+    print("No new data found.")
     exit()
 
-print(f"ℹ️ Query returned {len(df)} rows")
+print(f"Query returned {len(df)} rows")
 
 # --- Process the Data ---
 # Group by time and field type
@@ -305,11 +396,36 @@ for i, ts in enumerate(timestamps):
             tag=str(ts),
         )
 
+        # Debug info - uncomment if needed
+        # print(f"VW Example: {vw_example[:100]}...")
+
         # Get anomaly score from model (higher = more anomalous)
-        anomaly_score = anomaly_model.predict(vw_example)
+        try:
+            anomaly_score = anomaly_model.predict(vw_example)
+        except Exception as e:
+            print(f"Error predicting anomaly: {e}, example length: {len(vw_example)}")
+            # Try with a simpler example if the previous one failed
+            simple_example = f"1 |num const:1"
+            anomaly_score = anomaly_model.predict(simple_example)
 
         # Normalize score to 0-1 range
         normalized_score = min(1.0, max(0.0, anomaly_score))
+
+        # If all scores are zero, use a simple heuristic based on entity changes
+        if normalized_score == 0 and i > 0 and entity_changes:
+            # Calculate a simple anomaly score based on number of changes
+            change_count = len(entity_changes)
+            # More changes = higher score, with a cap at HEURISTIC_ANOMALY_THRESHOLD
+            heuristic_score = min(HEURISTIC_ANOMALY_THRESHOLD, change_count / 10)
+            print(
+                f"[{format_timestamp(ts)}] Using heuristic score: {heuristic_score:.4f} (based on {change_count} changes)"
+            )
+            normalized_score = heuristic_score
+
+        # Debug: Print all scores to see what values we're getting
+        print(
+            f"[{format_timestamp(ts)}] Anomaly score: {normalized_score:.4f} (threshold: {ANOMALY_THRESHOLD})"
+        )
 
         # Track entity changes since previous timestamp
         entity_changes = {}
@@ -333,11 +449,13 @@ for i, ts in enumerate(timestamps):
 
         # Print information if anomaly detected
         if is_anomaly:
-            print(f"[{ts}] 🚨 Anomaly detected! Score: {normalized_score:.4f}")
+            print(
+                f"[{format_timestamp(ts)}] Anomaly detected! Score: {normalized_score:.4f}"
+            )
 
             # Print entity changes if any
             if entity_changes:
-                print(f"[{ts}] 📊 Changed entities:")
+                print(f"[{format_timestamp(ts)}] Changed entities:")
                 for entity, change in entity_changes.items():
                     change_str = f"'{change['previous']}' → '{change['current']}'"
                     if "diff" in change:
@@ -346,45 +464,35 @@ for i, ts in enumerate(timestamps):
 
         # Run meta model to verify anomaly
         if entity_changes:
-            # Create meta-model features
-            meta_features = {
-                "score": normalized_score,
-                "change_count": len(entity_changes),
-                "timestamp": ts,
-            }
+            # Format meta example as a single string
+            meta_features_str = f"|m score:{normalized_score} change_count:{len(entity_changes)} hour:{context_features['hour']} day:{context_features['day_of_week']} weekend:{context_features['is_weekend']} |c"
 
-            # Add context features to meta model
-            meta_features.update(context_features)
-
-            # Format meta example
-            meta_example = ""
-            meta_example += "|m "
-            for k, v in meta_features.items():
-                if k != "timestamp":
-                    meta_example += f"{k}:{v} "
-
-            # Add changed entities info
-            meta_example += "|c "
+            # Add changed entities names
             for entity in entity_changes:
-                meta_example += f"{entity} "
+                # Clean entity name to avoid parsing issues
+                safe_entity = clean_value(str(entity))
+                meta_features_str += f" {safe_entity}"
 
             # Predict with meta model
-            meta_score = meta_model.predict(meta_example)
-            is_meta_anomaly = meta_score > 0.5
+            try:
+                meta_score = meta_model.predict(meta_features_str)
+                is_meta_anomaly = meta_score > 0.5
 
-            if is_meta_anomaly:
-                print(f"[{ts}] 🧠 Meta model confirms anomaly")
+                if is_meta_anomaly:
+                    print(f"[{format_timestamp(ts)}] Meta model confirms anomaly")
 
-                # Store change details for future reference
-                all_entity_changes.append(
-                    {
-                        "timestamp": ts,
-                        "score": normalized_score,
-                        "meta_score": meta_score,
-                        "changes": entity_changes,
-                        "is_anomaly": is_anomaly or is_meta_anomaly,
-                    }
-                )
+                    # Store change details for future reference
+                    all_entity_changes.append(
+                        {
+                            "timestamp": ts,
+                            "score": normalized_score,
+                            "meta_score": meta_score,
+                            "changes": entity_changes,
+                            "is_anomaly": is_anomaly or is_meta_anomaly,
+                        }
+                    )
+            except Exception as e:
+                print(f"Error with meta model: {e}")
 
         # Train the main model on this example - we always learn
         # For anomaly models using quantile regression, label=1 is standard
@@ -396,38 +504,68 @@ for i, ts in enumerate(timestamps):
             label=1,  # For quantile regression
             tag=str(ts),
         )
-        anomaly_model.learn(train_example)
+
+        try:
+            anomaly_model.learn(train_example)
+        except Exception as e:
+            print(f"Error training anomaly model: {e}")
 
         # Train the meta model if we have entity changes
         # Label with 1 if this is a true anomaly, -1 otherwise
         if entity_changes and i > 0:
             # Use the primary anomaly detection as a label for meta model
             meta_label = 1 if is_anomaly else -1
+            meta_train_example = f"{meta_label} {meta_features_str}"
 
-            meta_train_example = f"{meta_label} {meta_example}"
-            meta_model.learn(meta_train_example)
+            try:
+                meta_model.learn(meta_train_example)
+            except Exception as e:
+                print(f"Error training meta model: {e}")
 
     except Exception as e:
-        print(f"[{ts}] ⚠️ Error processing data: {e}")
+        print(f"[{format_timestamp(ts)}] Error processing data: {e}")
         import traceback
 
         traceback.print_exc()
 
 # --- Save models and changes ---
-# Keep only the last 100 changes to avoid memory issues
+# Keep track of all entity changes without limitation
 if all_entity_changes:
     change_history.extend(all_entity_changes)
-    if len(change_history) > 100:
-        change_history = change_history[-100:]
+    # Limitation removed: now storing entire change history
 
-# Save anomaly model
-anomaly_wrapper = VWModelWrapper(anomaly_model, stop_time, change_history)
-with open(ANOMALY_MODEL_PATH, "wb") as f:
-    pickle.dump(anomaly_wrapper, f)
+# Print model statistics to verify training has occurred
+print(
+    f"Anomaly model stats - Total examples processed: {round(anomaly_model.get_weighted_examples())}"
+)
+print(f"Anomaly model total loss: {round(anomaly_model.get_sum_loss())}")
+print(
+    f"Meta model stats - Total examples processed: {round(meta_model.get_weighted_examples())}"
+)
+print(f"Meta model total loss: {round(meta_model.get_sum_loss())}")
 
-# Save meta model
-meta_wrapper = VWModelWrapper(meta_model, stop_time)
-with open(META_MODEL_PATH, "wb") as f:
-    pickle.dump(meta_wrapper, f)
+# Save models to files
+try:
+    # Save the trained anomaly model
+    anomaly_model.save(ANOMALY_MODEL_PATH)
+    print(f"Anomaly model saved to {ANOMALY_MODEL_PATH}")
+except Exception as e:
+    print(f"Error saving anomaly model: {e}")
 
-print("✅ Models updated and saved.")
+try:
+    # Save the trained meta model
+    meta_model.save(META_MODEL_PATH)
+    print(f"Meta model saved to {META_MODEL_PATH}")
+except Exception as e:
+    print(f"Error saving meta model: {e}")
+
+# Save model info separately (without the model objects)
+model_info = ModelInfo(stop_time, change_history)
+try:
+    with open(MODEL_INFO_PATH, "wb") as f:
+        pickle.dump(model_info, f)
+    print(f"Model info saved to {MODEL_INFO_PATH}")
+except Exception as e:
+    print(f"Error saving model info: {e}")
+
+print("Models updated and saved.")
