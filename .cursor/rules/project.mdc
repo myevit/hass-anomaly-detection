@@ -1,8 +1,9 @@
 ---
 description: 
-globs: 
-alwaysApply: true
+globs: *.py
+alwaysApply: false
 ---
+
 Context-Aware Anomaly Detection for Smart Homes ￼
 
 Description:
@@ -23,4 +24,4 @@ Technical Stack:
 
 Objective:
 
-To enhance smart home security and efficiency by detecting anomalies in household behaviors through context-aware analysis, enabling proactive responses to potential issues. ￼
+To enhance smart home security and efficiency by detecting anomalies in household behaviors through context-aware analysis, enabling proactive responses to potential issues. 

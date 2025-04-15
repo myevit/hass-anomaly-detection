@@ -13,6 +13,7 @@ import holidays
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.stats import zscore
 from river import linear_model
+import numpy as np
 
 
 class ModelWrapper:
@@ -33,6 +34,10 @@ SAVE_TIMESTAMP_PATH = "last_cutoff.txt"
 CHUNK_SIZE = "5min"
 MISSING_TOKEN = "NaN"
 DEFAULT_DAYS = 7  # Default number of days to look back
+
+# --- Add at the top level, after the config section ---
+# Create a list to store all the changes during processing
+all_entity_changes = []
 
 # --- Influx connection ---
 client = InfluxDBClient(url=INFLUX_URL, token=TOKEN, org=ORG)
@@ -100,9 +105,13 @@ print(f"⏱️ Querying from {start} to {stop}...")
 query = f"""
 from(bucket: "{BUCKET}")
   |> range(start: {start}, stop: {stop})
-  |> filter(fn: (r) => r["_field"] == "value")
-  |> filter(fn: (r) => r["_measurement"] == "state")
-  |> pivot(rowKey: ["_time"], columnKey: ["entity_id"], valueColumn: "_value")
+  |> filter(fn: (r) =>
+      (r["_field"] == "value" or r["_field"] == "state") 
+  )
+  |> map(fn: (r) => ({{
+      r with entity_id: r.domain + "." + r.entity_id
+  }}))
+  |> drop(columns: ["domain", "_measurement", "_start", "_stop"])
 """
 df = query_api.query_data_frame(query)
 df = pd.concat(df) if isinstance(df, list) else df
@@ -110,14 +119,27 @@ if df.empty:
     print("⚠️ No new data found.")
     exit()
 
-# --- Separate numeric and text columns ---
-df = df.set_index("_time").sort_index()
-numeric_df = df.select_dtypes(include="number")
-text_df = df.select_dtypes(include="object")
+# Print shape of raw dataframe
+print(f"ℹ️ Query returned {len(df)} rows")
 
+# --- Process the data with a cleaner approach ---
+# First split by field type
+numeric_df = df[df["_field"] == "value"]
+text_df = df[df["_field"] == "state"]
 
-# --- Resample numeric data ---
-numeric_df = numeric_df.resample(CHUNK_SIZE).mean().interpolate().ffill().bfill()
+# Then pivot each separately
+numeric_df = numeric_df.pivot(
+    index="_time", columns="entity_id", values="_value"
+).astype(float)
+text_df = text_df.pivot(index="_time", columns="entity_id", values="_value").astype(str)
+
+# Fill missing values and resample
+numeric_df = numeric_df.interpolate().ffill().bfill()
+text_df = text_df.fillna(MISSING_TOKEN)
+
+# Resample to regular intervals
+numeric_df = numeric_df.resample(CHUNK_SIZE).mean()
+text_df = text_df.resample(CHUNK_SIZE).first()
 
 # --- Add context features ---
 ca_holidays = holidays.CA(prov="AB")
@@ -143,9 +165,12 @@ text_columns = text_df.columns.tolist()
 vectorizers = {col: TfidfVectorizer(max_features=5) for col in text_columns}
 for col in text_columns:
     try:
-        vectorizers[col].fit(text_df[col].astype(str))
-    except:
-        pass
+        # Ensure all values are strings and not empty
+        text_data = text_df[col].astype(str).replace(["nan", "None", ""], MISSING_TOKEN)
+        vectorizers[col].fit(text_data)
+    except Exception as e:
+        print(f"⚠️ Error fitting vectorizer for {col}: {e}")
+        vectorizers[col] = None  # Mark failed vectorizers
 
 
 def remand_compare(
@@ -180,13 +205,21 @@ def remand_compare(
     )  # limit to last N matching weeks
 
     if len(historical) < 3:
-        print(f"[{timestamp}] ⚠️ Not enough matching history for remand")
+        # print(f"[{timestamp}] ⚠️ Not enough matching history for remand")
         return None, False
 
     # Build comparison frame
     try:
-        hist_df = pd.DataFrame(historical)
-        cur_df = pd.DataFrame([current_vector], index=[timestamp])
+        # Convert current vector values to float
+        current_values = {
+            k: float(v)
+            for k, v in current_vector.items()
+            if isinstance(v, (int, float))
+        }
+
+        # Create DataFrame with proper numeric types
+        hist_df = pd.DataFrame(historical).astype(float)
+        cur_df = pd.DataFrame([current_values], index=[timestamp])
         full_df = pd.concat([hist_df, cur_df])
 
         # Calculate z-scores
@@ -215,7 +248,7 @@ def compare_to_yesterday(
     yesterday_time = timestamp - timedelta(days=1)
 
     if yesterday_time not in df_full.index:
-        print(f"[{timestamp}] ⚠️ No matching time yesterday")
+        # print(f"[{timestamp}] ⚠️ No matching time yesterday")
         return None, False
 
     hist_vector = df_full.loc[yesterday_time]
@@ -225,13 +258,23 @@ def compare_to_yesterday(
     outlier_count = 0
     for k in current_vector:
         if k in hist_vector and pd.notna(hist_vector[k]):
-            std = np.std([hist_vector[k], current_vector[k]])
-            if std == 0:
-                continue  # identical values → not outlier
-            z = abs(current_vector[k] - hist_vector[k]) / std
-            z_scores[k] = z
-            if z > z_thresh:
-                outlier_count += 1
+            try:
+                # Ensure both values are numeric
+                current_val = float(current_vector[k])
+                hist_val = float(hist_vector[k])
+
+                # Calculate standard deviation
+                values = [current_val, hist_val]
+                std = np.std(values)
+                if std == 0:
+                    continue  # identical values → not outlier
+                z = abs(current_val - hist_val) / std
+                z_scores[k] = z
+                if z > z_thresh:
+                    outlier_count += 1
+            except (ValueError, TypeError) as e:
+                print(f"⚠️ Error calculating z-score for {k}: {e}")
+                continue
 
     print(
         f"[{timestamp}] 🕒 Yesterday diff | outliers: {outlier_count}, max z: {max(z_scores.values() or [0]):.2f}"
@@ -240,28 +283,118 @@ def compare_to_yesterday(
     return outliers, len(outliers) > 0
 
 
+# --- Track entity changes ---
+def track_entity_changes(
+    current_data, previous_data, current_ts, prev_ts, text_cols=None
+):
+    """Track changes in entity values between current and previous timestamps.
+    Returns a dictionary of changed entities with their old and new values."""
+    changes = {}
+
+    # Track numeric changes
+    for col in current_data.columns:
+        if col in previous_data.columns:
+            curr_val = current_data[col].iloc[0]
+            prev_val = previous_data[col].iloc[0]
+
+            if pd.notna(curr_val) and pd.notna(prev_val) and curr_val != prev_val:
+                # Use column name directly - no validation or transformation
+                changes[col] = {
+                    "previous": prev_val,
+                    "current": curr_val,
+                    "diff": (
+                        curr_val - prev_val
+                        if isinstance(curr_val, (int, float))
+                        else None
+                    ),
+                }
+
+    # Track text changes if provided
+    if text_cols is not None:
+        for col in text_cols:
+            if col not in current_data or col not in previous_data:
+                continue
+
+            curr_text = current_data.get(col, pd.Series([MISSING_TOKEN])).iloc[0]
+            prev_text = previous_data.get(col, pd.Series([MISSING_TOKEN])).iloc[0]
+
+            curr_text = str(curr_text) if pd.notna(curr_text) else MISSING_TOKEN
+            prev_text = str(prev_text) if pd.notna(prev_text) else MISSING_TOKEN
+
+            if curr_text != prev_text and curr_text != MISSING_TOKEN:
+                # Use column name directly - no validation or transformation
+                changes[col] = {"previous": prev_text, "current": curr_text}
+
+    return changes
+
+
 # --- Merge numeric + encoded text and run model ---
 for ts in numeric_df.index:
-    x = numeric_df.loc[ts].to_dict()
-
-    # --- TF-IDF: handle text features ---
-    if ts in text_df.index:
-        for col in text_columns:
-            vec = vectorizers[col]
-            text = str(text_df.at[ts, col]) if ts in text_df.index else MISSING_TOKEN
-            if not text or text.lower() in ["nan", "none", ""]:
-                text = MISSING_TOKEN
-            tfidf = vec.transform([text]).toarray()[0]
-            for i, v in enumerate(tfidf):
-                x[f"{col}_tfidf_{i}"] = v
-
-    x = {k: v for k, v in x.items() if pd.notna(v)}
-
     try:
+        x = numeric_df.loc[ts].to_dict()
+
+        # --- TF-IDF: handle text features ---
+        if ts in text_df.index:
+            for col in text_columns:
+                if vectorizers[col] is None:
+                    continue
+                try:
+                    text = (
+                        str(text_df.at[ts, col])
+                        if ts in text_df.index
+                        else MISSING_TOKEN
+                    )
+                    if not text or text.lower() in ["nan", "none", ""]:
+                        text = MISSING_TOKEN
+                    tfidf = vectorizers[col].transform([text]).toarray()[0]
+                    for i, v in enumerate(tfidf):
+                        x[f"{col}_tfidf_{i}"] = float(v)  # Ensure float conversion
+                except Exception as e:
+                    print(f"⚠️ Error processing text feature {col} at {ts}: {e}")
+                    continue
+
+        # Ensure all feature values are float
+        x = {
+            k: float(v) if isinstance(v, (int, float)) else v
+            for k, v in x.items()
+            if pd.notna(v)
+        }
+
         # --- RIVER ---
         score = model.score_one(x)
         model.learn_one(x)
-        print(f"[{ts}] 🤖 River Score: {score:.4f}")
+
+        # Track changes for anomalies
+        entity_changes = {}
+        prev_ts = ts - pd.Timedelta(CHUNK_SIZE)
+
+        # Store anomaly details if score is significant
+        if abs(score) > 0:
+            print(f"[{ts}] 🤖 River Score: {score:.4f}")
+
+            # Get current and previous data frames
+            current_frame = numeric_df.loc[[ts]]
+            if prev_ts in numeric_df.index:
+                prev_frame = numeric_df.loc[[prev_ts]]
+                entity_changes = track_entity_changes(
+                    current_frame,
+                    prev_frame,
+                    ts,
+                    prev_ts,
+                    (
+                        text_columns
+                        if ts in text_df.index and prev_ts in text_df.index
+                        else None
+                    ),
+                )
+
+                if entity_changes:
+                    print(f"[{ts}] 📊 Changed entities:")
+                    for entity, change in entity_changes.items():
+                        change_str = f"'{change['previous']}' → '{change['current']}'"
+                        if "diff" in change and change["diff"] is not None:
+                            change_str += f" (diff: {change['diff']})"
+                        print(f"  - {entity}: {change_str}")
 
         # --- REMAND ---
         remand_outliers, remand_flag = remand_compare(x, ts, numeric_df)
@@ -279,49 +412,106 @@ for ts in numeric_df.index:
             )
 
         # --- META MODEL ---
-        x_meta = {
-            "river_score": score,
-            "remand_outlier_count": len(remand_outliers) if remand_outliers else 0,
-            "yesterday_outlier_count": len(y_outliers) if y_outliers else 0,
-            **x,  # full state vector
-        }
+        try:
+            # Include entity changes in meta model features
+            x_meta = {
+                "river_score": float(score),
+                "remand_outlier_count": float(
+                    len(remand_outliers) if remand_outliers else 0
+                ),
+                "yesterday_outlier_count": float(len(y_outliers) if y_outliers else 0),
+                "entity_change_count": float(len(entity_changes)),
+            }
+            # Add numeric features
+            for k, v in x.items():
+                if isinstance(v, (int, float)):
+                    x_meta[k] = float(v)
 
-        # Track text changes in last 5 minutes
-        prev_ts = ts - pd.Timedelta(CHUNK_SIZE)
-        changed_entities = []
+            # Track text changes in last 5 minutes
+            changed_entities = []
+            entity_change_details = {}
 
-        for col in text_columns:
-            now = str(text_df.at[ts, col]) if ts in text_df.index else MISSING_TOKEN
-            prev = (
-                str(text_df.at[prev_ts, col])
-                if prev_ts in text_df.index
-                else MISSING_TOKEN
-            )
+            for col in text_columns:
+                try:
+                    now = (
+                        str(text_df.at[ts, col])
+                        if ts in text_df.index
+                        else MISSING_TOKEN
+                    )
+                    prev = (
+                        str(text_df.at[prev_ts, col])
+                        if prev_ts in text_df.index
+                        else MISSING_TOKEN
+                    )
 
-            if not now or now.lower() in ["nan", "none", ""]:
-                now = MISSING_TOKEN
-            if not prev or prev.lower() in ["nan", "none", ""]:
-                prev = MISSING_TOKEN
+                    if not now or now.lower() in ["nan", "none", ""]:
+                        now = MISSING_TOKEN
+                    if not prev or prev.lower() in ["nan", "none", ""]:
+                        prev = MISSING_TOKEN
 
-            changed = int(now != prev)
-            x_meta[f"{col}_changed_5min"] = changed
-            if changed:
-                changed_entities.append(col)
+                    changed = int(now != prev)
+                    x_meta[f"{col}_changed_5min"] = float(changed)
+                    if changed:
+                        # Use the column name directly without transformation
+                        changed_entities.append(col)
+                        entity_change_details[col] = {"previous": prev, "current": now}
+                except Exception as e:
+                    print(f"⚠️ Error processing text change for {col}: {e}")
 
-        x_meta["changed_entities"] = changed_entities  # for logging
+            # Don't include non-numeric data in x_meta
+            x_meta["changed_count"] = float(len(changed_entities))
 
-        is_meta_anomaly = meta_model.predict_one(x_meta)
-        print(
-            f"[{ts}] 🧠 Meta anomaly? → {is_meta_anomaly} | Changed: {changed_entities}"
-        )
+            is_meta_anomaly = meta_model.predict_one(x_meta)
+            if is_meta_anomaly:
+                # Print the actual entities that changed
+                if changed_entities:
+                    entities_str = ", ".join(changed_entities)
+                    print(f"[{ts}] 🧠 Meta anomaly: | Changed entities: {entities_str}")
+                    # Print the details of each changed entity
+                    print(f"[{ts}] 📱 Entity change details:")
+                    for entity, change in entity_change_details.items():
+                        print(
+                            f"  - {entity}: '{change['previous']}' → '{change['current']}'"
+                        )
+                else:
+                    print(f"[{ts}] 🧠 Meta anomaly: | No text entities changed")
 
-        # Optional: implicit label = any model flagged
-        y = int(remand_flag or y_flag or score > 0.4)
-        meta_model.learn_one(x_meta, y)
+            # Optional: implicit label = any model flagged
+            y = float(remand_flag or y_flag or score > 0.4)
+            meta_model.learn_one(x_meta, y)
+
+            # Instead of directly updating model_wrapper, collect the changes
+            if entity_changes and (abs(score) > 0 or remand_flag or y_flag):
+                # Include text entity changes too
+                if entity_change_details:
+                    entity_changes.update(entity_change_details)
+
+                all_entity_changes.append(
+                    {
+                        "timestamp": ts,
+                        "score": score,
+                        "changes": entity_changes,
+                        "ha_entities": changed_entities,  # Use the entities directly
+                    }
+                )
+        except Exception as e:
+            print(f"[{ts}] ⚠️ Meta model error: {e}")
 
     except Exception as e:
         print(f"[{ts}] ⚠️ Skipped due to error: {e}")
+        import traceback
 
+        traceback.print_exc()
+
+
+# --- Update the model wrapper with the collected changes ---
+if all_entity_changes:
+    if not hasattr(model, "change_history"):
+        model.change_history = []
+    model.change_history.extend(all_entity_changes)
+    # Keep only the last 100 changes to avoid memory issues
+    if len(model.change_history) > 100:
+        model.change_history = model.change_history[-100:]
 
 # --- Save model and new cutoff ---
 model_wrapper = ModelWrapper(model, stop_time)
