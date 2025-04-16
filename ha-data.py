@@ -18,14 +18,14 @@ TOKEN = "LY86Tqy1cg5-UYTYPMmHI5opIxC2_NtLiZexyHehiqmL7YLGyHOyEeosm9JXAnoVuNaZT5T
 ORG = "myeHome"
 BUCKET = "home-assistant"
 MODELS_DIR = "models"
-ANOMALY_MODEL_PATH = os.path.join(MODELS_DIR, "vw_anomaly_model.vw")
-META_MODEL_PATH = os.path.join(MODELS_DIR, "vw_meta_model.vw")
-ANOMALY_HISTORY_PATH = os.path.join(MODELS_DIR, "anomaly_history.pkl")
+ANOMALY_MODEL_PATH = os.path.join(MODELS_DIR, "anomaly_model.vw")
+META_MODEL_PATH = os.path.join(MODELS_DIR, "meta_model.vw")
+ANOMALY_HISTORY_PATH = os.path.join(MODELS_DIR, "anomaly_history.vw")
 CHUNK_SIZE = "5min"
 DEFAULT_DAYS = 7  # Default number of days to look back
 ANOMALY_THRESHOLD = 0.7  # Threshold for anomaly detection
 HEURISTIC_ANOMALY_THRESHOLD = 0.0  # Threshold for testing anomaly detection if real anomaly score is 0. must be higher than ANOMALY_THRESHOLD
-FORCE_RETRAIN = True  # Set to True to force model retraining
+FORCE_RETRAIN = False  # Set to True to force model retraining
 
 # --- Ensure model directory exists ---
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -570,7 +570,12 @@ for i, ts in enumerate(timestamps):
         normalized_score = min(1.0, max(0.0, anomaly_score))
 
         # If all scores are zero, use a simple heuristic based on entity changes
-        if normalized_score == 0 and i > 0 and entity_changes:
+        if (
+            normalized_score == 0
+            and i > 0
+            and entity_changes
+            and HEURISTIC_ANOMALY_THRESHOLD > 0
+        ):
             # Calculate a simple anomaly score based on number of changes
             change_count = len(entity_changes)
             # More changes = higher score, with a cap at HEURISTIC_ANOMALY_THRESHOLD
@@ -581,9 +586,9 @@ for i, ts in enumerate(timestamps):
             normalized_score = heuristic_score
 
         # Debug: Print all scores to see what values we're getting
-        print(
-            f"[{format_timestamp(ts)}] Anomaly score: {normalized_score:.4f} (threshold: {ANOMALY_THRESHOLD})"
-        )
+        # print(
+        #     f"[{format_timestamp(ts)}] Anomaly score: {normalized_score:.4f} (threshold: {ANOMALY_THRESHOLD})"
+        # )
 
         # Track entity changes since previous timestamp
         entity_changes = {}
