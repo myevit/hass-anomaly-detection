@@ -21,7 +21,31 @@ import pickle
 import holidays
 import warnings
 from influxdb_client.client.warnings import MissingPivotFunction
-import pytz
+
+# At the top, after imports
+# Import config if available
+try:
+    import config
+
+    # Use imported config values
+    INFLUX_URL = config.INFLUX_URL
+    TOKEN = config.TOKEN
+    ORG = config.ORG
+    BUCKET = config.BUCKET
+    MODELS_DIR = config.MODELS_DIR
+    ANOMALY_MODEL_PATH = config.ANOMALY_MODEL_PATH
+    META_MODEL_PATH = config.META_MODEL_PATH
+    ANOMALY_HISTORY_PATH = config.ANOMALY_HISTORY_PATH
+    CHUNK_SIZE = config.CHUNK_SIZE
+    DEFAULT_DAYS = config.DEFAULT_DAYS
+    ANOMALY_THRESHOLD = config.ANOMALY_THRESHOLD
+    META_ANOMALY_THRESHOLD = config.META_ANOMALY_THRESHOLD
+    FORCE_RETRAIN = config.FORCE_RETRAIN
+    print("Loaded configuration from config.py")
+except ImportError:
+    # Use default configuration
+    print("No config.py found, using default configuration")
+    # Keep existing configuration here...
 
 # Add this right after your imports
 print("Script starting, ModelInfo class will be defined soon...")
@@ -42,35 +66,36 @@ class ModelInfo:
         self.change_history = change_history or []
 
 
-# === CONFIGURATION ===
-# Connection parameters for InfluxDB.
-INFLUX_URL = "http://192.168.1.4:8086"
-TOKEN = "LY86Tqy1cg5-UYTYPMmHI5opIxC2_NtLiZexyHehiqmL7YLGyHOyEeosm9JXAnoVuNaZT5TYNNcMW1eQK3qW3g=="
-ORG = "myeHome"
-BUCKET = "home-assistant"
+# # === CONFIGURATION ===
+# # Connection parameters for InfluxDB.
+# # Connection parameters for InfluxDB.
+# INFLUX_URL = "http://192.168.1.4:8086"
+# TOKEN = "LY86Tqy1cg5-UYTYPMmHI5opIxC2_NtLiZexyHehiqmL7YLGyHOyEeosm9JXAnoVuNaZT5TYNNcMW1eQK3qW3g=="
+# ORG = "myeHome"
+# BUCKET = "home-assistant"
 
-# Model storage paths.
-MODELS_DIR = "models"
-ANOMALY_MODEL_PATH = os.path.join(
-    MODELS_DIR, "anomaly_model.vw"
-)  # Primary anomaly detection model.
-META_MODEL_PATH = os.path.join(
-    MODELS_DIR, "meta_model.vw"
-)  # Secondary verification model.
-ANOMALY_HISTORY_PATH = os.path.join(
-    MODELS_DIR, "anomaly_history.pkl"
-)  # Stores history of detected anomalies.
+# # Model storage paths.
+# MODELS_DIR = "models"
+# ANOMALY_MODEL_PATH = os.path.join(
+#     MODELS_DIR, "anomaly_model.vw"
+# )  # Primary anomaly detection model.
+# META_MODEL_PATH = os.path.join(
+#     MODELS_DIR, "meta_model.vw"
+# )  # Secondary verification model.
+# ANOMALY_HISTORY_PATH = os.path.join(
+#     MODELS_DIR, "anomaly_history.pkl"
+# )  # Stores history of detected anomalies.
 
-# Data processing parameters.
-CHUNK_SIZE = "5min"  # Time interval for aggregating data.
-DEFAULT_DAYS = 7  # Default number of days to look back for historical data.
+# # Data processing parameters.
+# CHUNK_SIZE = "5min"  # Time interval for aggregating data.
+# DEFAULT_DAYS = 7  # Default number of days to look back for historical data.
 
-# Anomaly detection thresholds.
-ANOMALY_THRESHOLD = 0.9  # Primary anomaly score threshold (0-1 scale).
-META_ANOMALY_THRESHOLD = 0.5  # Threshold for meta model anomaly confirmation.
+# # Anomaly detection thresholds.
+# ANOMALY_THRESHOLD = 0.9  # Primary anomaly score threshold (0-1 scale).
+# META_ANOMALY_THRESHOLD = 0.5  # Threshold for meta model anomaly confirmation.
 
-# Training control.
-FORCE_RETRAIN = False  # Set to True to force model retraining from scratch.
+# # Training control.
+# FORCE_RETRAIN = False  # Set to True to force model retraining from scratch.
 
 # === INITIALIZATION ===
 # --- Directory Setup ---
