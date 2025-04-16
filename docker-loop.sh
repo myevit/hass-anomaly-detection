@@ -36,8 +36,7 @@ while true; do
     echo "Will retry in ${SLEEP_AFTER_ERROR} seconds"
     sleep ${SLEEP_AFTER_ERROR}
   else
-    echo "Script completed successfully"
-    echo "Next run in ${SLEEP_TIME} seconds"
+    echo "Script completed successfully. Next run in ${SLEEP_TIME} seconds"
     sleep ${SLEEP_TIME}
   fi
 done 

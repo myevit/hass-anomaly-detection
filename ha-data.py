@@ -376,6 +376,8 @@ def format_vw_example(
     numeric_features,
     text_features=None,
     context_features=None,
+    binary_transitions=None,
+    binary_durations=None,
     label=None,
     tag=None,
 ):
@@ -386,12 +388,16 @@ def format_vw_example(
     - num: numeric sensor values
     - txt: text/categorical states
     - ctx: contextual features (time, etc.)
+    - bin: binary state transitions
+    - dur: state durations
 
     Args:
         timestamp: for tag and context features.
         numeric_features: dict of sensor numeric values.
         text_features: dict of sensor text states.
         context_features: dict of time context features (hour, day, etc.).
+        binary_transitions: dict of transition counts for binary entities.
+        binary_durations: dict of state durations for binary entities.
         label: optional label for training.
         tag: optional example tag for tracking.
 
@@ -431,6 +437,27 @@ def format_vw_example(
                 txt_parts.append(f"{safe_name}_{safe_value}")
         if txt_parts:
             ns_strings.append("|txt " + " ".join(txt_parts))
+
+    # Add binary state transitions namespace
+    if binary_transitions:
+        bin_parts = []
+        for entity, count in binary_transitions.items():
+            if count > 0:  # Only include entities with transitions
+                safe_name = clean_value(str(entity))
+                bin_parts.append(f"trs_{safe_name}:{count}")
+        if bin_parts:
+            ns_strings.append("|bin " + " ".join(bin_parts))
+
+    # Add binary state durations namespace
+    if binary_durations:
+        dur_parts = []
+        for entity, states in binary_durations.items():
+            for state, duration in states.items():
+                safe_entity = clean_value(str(entity))
+                safe_state = clean_value(str(state))
+                dur_parts.append(f"dur_{safe_entity}_{safe_state}:{duration}")
+        if dur_parts:
+            ns_strings.append("|dur " + " ".join(dur_parts))
 
     # Add time context namespace.
     if context_features:
@@ -721,17 +748,50 @@ print(f"Query returned {len(df)} rows")
 # --- Time Series Grouping ---
 # Convert time column to datetime and group by time and field type.
 df["_time"] = pd.to_datetime(df["_time"])
-df_grouped = df.set_index("_time").groupby([pd.Grouper(freq=CHUNK_SIZE), "_field"])
+
+# Sort data by time for proper sequence analysis
+df = df.sort_values("_time")
 
 # Create a dictionary to store all data points, indexed by timestamp.
 all_data = {}
 all_entities = set()
 
+# Track binary state transitions and durations
+binary_transitions = {}  # Count of state changes per entity within window
+binary_durations = {}  # Duration in seconds per state for binary entities
+previous_states = {}  # Track previous state for detecting transitions
+previous_times = {}  # Track previous time for duration calculation
+
+# Identify initial state for each entity
+for _, row in df.iterrows():
+    entity_id = row["entity_id"]
+    field_type = row["_field"]
+
+    # Only consider state fields for binary state tracking
+    if field_type == "state":
+        value = str(row["_value"])
+        time = row["_time"]
+
+        # Initialize if we haven't seen this entity before
+        if entity_id not in previous_states:
+            previous_states[entity_id] = value
+            previous_times[entity_id] = time
+            # Initialize transition counter
+            binary_transitions[entity_id] = 0
+
+# Create groups by time chunk
+df_grouped = df.set_index("_time").groupby([pd.Grouper(freq=CHUNK_SIZE), "_field"])
+
 # --- Data Organization ---
 # Process each time chunk and organize by field type.
 for (timestamp, field_type), group in df_grouped:
     if timestamp not in all_data:
-        all_data[timestamp] = {"numeric": {}, "text": {}}
+        all_data[timestamp] = {
+            "numeric": {},
+            "text": {},
+            "binary_transitions": {},
+            "binary_durations": {},
+        }
 
     # Store data by field type.
     if field_type == "value":
@@ -747,8 +807,48 @@ for (timestamp, field_type), group in df_grouped:
         for _, row in group.iterrows():
             entity_id = row["entity_id"]
             value = str(row["_value"])
+            current_time = row.name  # Use index which is the timestamp
+
+            # Store the text state
             all_data[timestamp]["text"][entity_id] = value
             all_entities.add(entity_id)
+
+            # If we have previous state information, we can calculate transitions and durations
+            if entity_id in previous_states:
+                prev_value = previous_states[entity_id]
+                prev_time = previous_times[entity_id]
+
+                # Check if this is a state transition
+                if value != prev_value:
+                    # Increment transition counter
+                    if entity_id in binary_transitions:
+                        binary_transitions[entity_id] += 1
+                    else:
+                        binary_transitions[entity_id] = 1
+
+                # Calculate duration in previous state (in seconds)
+                duration = (current_time - prev_time).total_seconds()
+
+                # Update duration counters
+                if entity_id not in binary_durations:
+                    binary_durations[entity_id] = {}
+
+                if prev_value not in binary_durations[entity_id]:
+                    binary_durations[entity_id][prev_value] = duration
+                else:
+                    binary_durations[entity_id][prev_value] += duration
+
+                # Update previous state and time
+                previous_states[entity_id] = value
+                previous_times[entity_id] = current_time
+
+        # Store transitions and durations for this time window
+        # Copy the counts to avoid sharing the reference
+        all_data[timestamp]["binary_transitions"] = binary_transitions.copy()
+        all_data[timestamp]["binary_durations"] = binary_durations.copy()
+
+        # Reset transition counters for the next window
+        binary_transitions = {entity_id: 0 for entity_id in binary_transitions}
 
 # Sort timestamps for chronological processing.
 timestamps = sorted(all_data.keys())
@@ -777,6 +877,8 @@ for i, ts in enumerate(timestamps):
             numeric_features=current_time_data["numeric"],
             text_features=current_time_data["text"],
             context_features=context_features,
+            binary_transitions=current_time_data["binary_transitions"],
+            binary_durations=current_time_data["binary_durations"],
         )
 
         # Debug info - uncomment if needed.
@@ -818,6 +920,16 @@ for i, ts in enumerate(timestamps):
             )
             entity_changes.update(text_changes)
 
+            # Add binary state transition information to the changes
+            for entity, count in current_time_data["binary_transitions"].items():
+                if count > 0 and entity in entity_changes:
+                    entity_changes[entity]["transitions"] = count
+
+            # Add duration information to the changes
+            for entity, states in current_time_data["binary_durations"].items():
+                if entity in entity_changes:
+                    entity_changes[entity]["durations"] = states
+
         # --- Anomaly Evaluation ---
         # Check if this exceeds the anomaly threshold.
         is_anomaly = normalized_score > ANOMALY_THRESHOLD
@@ -835,6 +947,13 @@ for i, ts in enumerate(timestamps):
                     change_str = f"'{change['previous']}' → '{change['current']}'"
                     if "diff" in change:
                         change_str += f" (diff: {change['diff']:.4f})"
+                    if "transitions" in change:
+                        change_str += f" [transitions: {change['transitions']}]"
+                    if "durations" in change:
+                        durations_str = ", ".join(
+                            [f"{s}: {d:.1f}s" for s, d in change["durations"].items()]
+                        )
+                        change_str += f" [durations: {durations_str}]"
                     print(f"  - {entity}: {change_str}")
 
         # --- Meta Model Verification ---
@@ -848,6 +967,10 @@ for i, ts in enumerate(timestamps):
                 # Clean entity name to avoid parsing issues.
                 safe_entity = clean_value(str(entity))
                 meta_features_str += f" {safe_entity}"
+
+                # Add transition counts for binary entities
+                if "transitions" in entity_changes[entity]:
+                    meta_features_str += f"_{entity_changes[entity]['transitions']}"
 
             # Predict with meta model.
             try:
@@ -878,6 +1001,8 @@ for i, ts in enumerate(timestamps):
             numeric_features=current_time_data["numeric"],
             text_features=current_time_data["text"],
             context_features=context_features,
+            binary_transitions=current_time_data["binary_transitions"],
+            binary_durations=current_time_data["binary_durations"],
             label=1,  # For quantile regression.
         )
 
