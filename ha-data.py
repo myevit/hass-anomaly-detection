@@ -23,6 +23,25 @@ import warnings
 from influxdb_client.client.warnings import MissingPivotFunction
 import pytz
 
+# Add this right after your imports
+print("Script starting, ModelInfo class will be defined soon...")
+
+
+# === DATA CLASSES ===
+class ModelInfo:
+    """
+    Class to store model metadata and anomaly history between runs.
+
+    Attributes:
+        last_cutoff (datetime): Timestamp of last processed data.
+        change_history (list): History of detected anomalies and their details.
+    """
+
+    def __init__(self, last_cutoff, change_history=None):
+        self.last_cutoff = last_cutoff
+        self.change_history = change_history or []
+
+
 # === CONFIGURATION ===
 # Connection parameters for InfluxDB.
 INFLUX_URL = "http://192.168.1.4:8086"
@@ -47,7 +66,7 @@ CHUNK_SIZE = "5min"  # Time interval for aggregating data.
 DEFAULT_DAYS = 7  # Default number of days to look back for historical data.
 
 # Anomaly detection thresholds.
-ANOMALY_THRESHOLD = 0.7  # Primary anomaly score threshold (0-1 scale).
+ANOMALY_THRESHOLD = 0.9  # Primary anomaly score threshold (0-1 scale).
 META_ANOMALY_THRESHOLD = 0.5  # Threshold for meta model anomaly confirmation.
 HEURISTIC_ANOMALY_THRESHOLD = 0.0  # Fallback threshold when real score is 0 (must be higher than ANOMALY_THRESHOLD to have any effect).
 
@@ -79,29 +98,33 @@ if FORCE_RETRAIN:
     # last_cutoff is already initialized above.
 else:
     # Load existing model info if available to continue from last run.
-    if os.path.exists(ANOMALY_HISTORY_PATH):
-        try:
-            with open(ANOMALY_HISTORY_PATH, "rb") as f:
-                anomaly_history = pickle.load(f)
-                last_cutoff = anomaly_history.last_cutoff
-                change_history = anomaly_history.change_history
-        except Exception as e:
-            print(f"Error loading anomaly history: {e}")
+    try:
+        print(f"About to load pickle from {ANOMALY_HISTORY_PATH}")
+        with open(ANOMALY_HISTORY_PATH, "rb") as f:
+            print("File opened successfully")
+            raw_data = pickle.load(f)
+            print("Pickle loaded successfully")
 
+        # Create a new ModelInfo object regardless of what was loaded
+        if hasattr(raw_data, "last_cutoff") and hasattr(raw_data, "change_history"):
+            # Create fresh instance with current class definition
+            last_cutoff = raw_data.last_cutoff
+            change_history = raw_data.change_history
+        else:
+            # Handle dict format or unexpected data
+            last_cutoff = (
+                raw_data.get("last_cutoff", last_cutoff)
+                if isinstance(raw_data, dict)
+                else last_cutoff
+            )
+            change_history = (
+                raw_data.get("change_history", []) if isinstance(raw_data, dict) else []
+            )
+    except Exception as e:
+        print(f"Error loading anomaly history: {e}")
+        import traceback
 
-# === DATA CLASSES ===
-class ModelInfo:
-    """
-    Class to store model metadata and anomaly history between runs.
-
-    Attributes:
-        last_cutoff (datetime): Timestamp of last processed data.
-        change_history (list): History of detected anomalies and their details.
-    """
-
-    def __init__(self, last_cutoff, change_history=None):
-        self.last_cutoff = last_cutoff
-        self.change_history = change_history or []
+        traceback.print_exc()  # Print the full stack trace
 
 
 # === ANALYSIS FUNCTIONS ===
@@ -550,9 +573,9 @@ def create_anomaly_model(save_path=None):
     Returns:
         VW model workspace.
     """
-    args = "--quiet --loss_function quantile --quantile_tau 0.9 --ngram txt:3 --skips txt:1 --bit_precision 28 --adaptive --normalized"
+    args = "--loss_function quantile --quantile_tau 0.9 --ngram txt:3 --skips txt:1 --bit_precision 28 --adaptive --normalized"
     if save_path:
-        args += f" -f {save_path} --save_resume"
+        args += f" -f {save_path}"
     return vowpalwabbit.Workspace(args)
 
 
@@ -572,9 +595,9 @@ def create_meta_model(save_path=None):
     Returns:
         VW model workspace.
     """
-    args = "--quiet --loss_function logistic --binary --ngram txt:2 --bit_precision 28"
+    args = "--loss_function logistic --binary --ngram txt:2 --bit_precision 28"
     if save_path:
-        args += f" -f {save_path} --save_resume"
+        args += f" -f {save_path}"
     return vowpalwabbit.Workspace(args)
 
 
@@ -583,27 +606,27 @@ def create_meta_model(save_path=None):
 if os.path.exists(ANOMALY_MODEL_PATH):
     try:
         # Load existing model.
-        anomaly_model = vowpalwabbit.Workspace(f"--quiet -i {ANOMALY_MODEL_PATH}")
+        anomaly_model = vowpalwabbit.Workspace(f"-i {ANOMALY_MODEL_PATH}")
     except Exception as e:
         print(f"Error loading anomaly model: {e}")
         # Fall back to creating a new model.
-        anomaly_model = create_anomaly_model()
+        anomaly_model = create_anomaly_model(ANOMALY_MODEL_PATH)
 else:
     # Create new model.
-    anomaly_model = create_anomaly_model()
+    anomaly_model = create_anomaly_model(ANOMALY_MODEL_PATH)
 
 # --- Create or Load Meta Model ---
 if os.path.exists(META_MODEL_PATH):
     try:
         # Load existing model.
-        meta_model = vowpalwabbit.Workspace(f"--quiet -i {META_MODEL_PATH}")
+        meta_model = vowpalwabbit.Workspace(f"-i {META_MODEL_PATH}")
     except Exception as e:
         print(f"Error loading meta model: {e}")
         # Fall back to creating a new model.
-        meta_model = create_meta_model()
+        meta_model = create_meta_model(META_MODEL_PATH)
 else:
     # Create new model.
-    meta_model = create_meta_model()
+    meta_model = create_meta_model(META_MODEL_PATH)
 
 # === DATA RETRIEVAL ===
 # --- Find Latest Data ---
@@ -730,7 +753,6 @@ for i, ts in enumerate(timestamps):
             numeric_features=current_time_data["numeric"],
             text_features=current_time_data["text"],
             context_features=context_features,
-            tag=str(ts),
         )
 
         # Debug info - uncomment if needed.
@@ -850,7 +872,6 @@ for i, ts in enumerate(timestamps):
             text_features=current_time_data["text"],
             context_features=context_features,
             label=1,  # For quantile regression.
-            tag=str(ts),
         )
 
         try:
