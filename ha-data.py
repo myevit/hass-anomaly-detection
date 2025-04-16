@@ -68,7 +68,6 @@ DEFAULT_DAYS = 7  # Default number of days to look back for historical data.
 # Anomaly detection thresholds.
 ANOMALY_THRESHOLD = 0.9  # Primary anomaly score threshold (0-1 scale).
 META_ANOMALY_THRESHOLD = 0.5  # Threshold for meta model anomaly confirmation.
-HEURISTIC_ANOMALY_THRESHOLD = 0.0  # Fallback threshold when real score is 0 (must be higher than ANOMALY_THRESHOLD to have any effect).
 
 # Training control.
 FORCE_RETRAIN = False  # Set to True to force model retraining from scratch.
@@ -770,23 +769,6 @@ for i, ts in enumerate(timestamps):
 
         # Normalize score to 0-1 range.
         normalized_score = min(1.0, max(0.0, anomaly_score))
-
-        # --- Heuristic Anomaly Detection ---
-        # Fallback for when model produces zero scores.
-        if (
-            normalized_score == 0
-            and i > 0
-            and entity_changes
-            and HEURISTIC_ANOMALY_THRESHOLD > 0
-        ):
-            # Calculate a simple anomaly score based on number of changes.
-            change_count = len(entity_changes)
-            # More changes = higher score, with a cap at HEURISTIC_ANOMALY_THRESHOLD.
-            heuristic_score = min(HEURISTIC_ANOMALY_THRESHOLD, change_count / 10)
-            print(
-                f"[{format_timestamp(ts)}] Using heuristic score: {heuristic_score:.4f} (based on {change_count} changes)"
-            )
-            normalized_score = heuristic_score
 
         # Debug: Print all scores to see what values we're getting.
         # print(
