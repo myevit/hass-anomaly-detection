@@ -1,2 +1,3 @@
-*.pkl
+*.vw
 /models/
+/.conda/
