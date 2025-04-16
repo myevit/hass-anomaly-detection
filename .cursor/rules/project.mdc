@@ -4,7 +4,7 @@ globs: *.py
 alwaysApply: false
 ---
 
-Context-Aware Anomaly Detection for Smart Homes ￼
+Context-Aware Anomaly Detection for Smart Homes
 
 Description:
 
@@ -17,11 +17,17 @@ Key Features:
 	•	Adaptive Learning: The model continuously learns and adapts to changes in household routines, improving its accuracy over time.
 
 Technical Stack:
-	•	Data Collection: Home Assistant for smart home data aggregation. ￼
+	•	Data Collection: Home Assistant for smart home data aggregation.
 	•	Data Storage: InfluxDB for efficient time-series data storage.
 	•	Data Processing: Python for data manipulation and preprocessing.
-	•	Machine Learning: for implementing anomaly detection algorithms. ￼
+	•	Machine Learning: for implementing anomaly detection algorithms.
 
 Objective:
 
 To enhance smart home security and efficiency by detecting anomalies in household behaviors through context-aware analysis, enabling proactive responses to potential issues. 
+
+The test question for the successful project willbe: Is it anomaly?
+	- Garage door is opened and 3am on friday
+	- Kitchen electlicity is using more then yesterday, but now there is no motion detection in the living room
+	- ERV switch is off but furnece is heating
+	- Patio door is open for 30 min at 5pm on Sunday and it's January
