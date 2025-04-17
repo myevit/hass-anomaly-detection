@@ -22,6 +22,7 @@ META_ANOMALY_THRESHOLD = 0.5  # Threshold for meta model anomaly confirmation
 
 # Training control
 FORCE_RETRAIN = False  # Set to True to force model retraining from scratch
+MAX_BINARY_STATES = 3  # Typical binary entities have 2-3 states
 
 # Verbosity level
 DEBUG = False  # Set to True for more detailed logs

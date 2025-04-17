@@ -41,6 +41,7 @@ try:
     ANOMALY_THRESHOLD = config.ANOMALY_THRESHOLD
     META_ANOMALY_THRESHOLD = config.META_ANOMALY_THRESHOLD
     FORCE_RETRAIN = config.FORCE_RETRAIN
+    MAX_BINARY_STATES = config.MAX_BINARY_STATES
     print("Loaded configuration from config.py")
 except ImportError:
     # Use default configuration
@@ -762,13 +763,43 @@ binary_durations = {}  # Duration in seconds per state for binary entities
 previous_states = {}  # Track previous state for detecting transitions
 previous_times = {}  # Track previous time for duration calculation
 
-# Identify initial state for each entity
+# Dictionary to track unique states per entity
+entity_unique_states = {}
+# Maximum number of unique states to still be considered binary-like
+# Set of entities that behave like binary sensors
+binary_like_entities = set()
+
+# First pass - identify entities that behave like binary sensors
+print("Analyzing entity behavior patterns...")
 for _, row in df.iterrows():
     entity_id = row["entity_id"]
     field_type = row["_field"]
 
-    # Only consider state fields for binary state tracking
+    # Only analyze text states
     if field_type == "state":
+        value = str(row["_value"])
+
+        # Track unique states for this entity
+        if entity_id not in entity_unique_states:
+            entity_unique_states[entity_id] = set()
+
+        entity_unique_states[entity_id].add(value)
+
+# Determine which entities behave like binary sensors
+for entity_id, states in entity_unique_states.items():
+    if len(states) <= MAX_BINARY_STATES:
+        binary_like_entities.add(entity_id)
+        print(
+            f"Entity {entity_id} behaves like a binary sensor with states: {', '.join(states)}"
+        )
+
+# Identify initial state for binary-like entities
+for _, row in df.iterrows():
+    entity_id = row["entity_id"]
+    field_type = row["_field"]
+
+    # Only consider state fields for binary-like entities
+    if field_type == "state" and entity_id in binary_like_entities:
         value = str(row["_value"])
         time = row["_time"]
 
@@ -809,38 +840,40 @@ for (timestamp, field_type), group in df_grouped:
             value = str(row["_value"])
             current_time = row.name  # Use index which is the timestamp
 
-            # Store the text state
+            # Store the text state for all entities
             all_data[timestamp]["text"][entity_id] = value
             all_entities.add(entity_id)
 
-            # If we have previous state information, we can calculate transitions and durations
-            if entity_id in previous_states:
-                prev_value = previous_states[entity_id]
-                prev_time = previous_times[entity_id]
+            # Only track transitions for binary-like entities
+            if entity_id in binary_like_entities:
+                # If we have previous state information, we can calculate transitions and durations
+                if entity_id in previous_states:
+                    prev_value = previous_states[entity_id]
+                    prev_time = previous_times[entity_id]
 
-                # Check if this is a state transition
-                if value != prev_value:
-                    # Increment transition counter
-                    if entity_id in binary_transitions:
-                        binary_transitions[entity_id] += 1
+                    # Check if this is a state transition
+                    if value != prev_value:
+                        # Increment transition counter
+                        if entity_id in binary_transitions:
+                            binary_transitions[entity_id] += 1
+                        else:
+                            binary_transitions[entity_id] = 1
+
+                    # Calculate duration in previous state (in seconds)
+                    duration = (current_time - prev_time).total_seconds()
+
+                    # Update duration counters
+                    if entity_id not in binary_durations:
+                        binary_durations[entity_id] = {}
+
+                    if prev_value not in binary_durations[entity_id]:
+                        binary_durations[entity_id][prev_value] = duration
                     else:
-                        binary_transitions[entity_id] = 1
+                        binary_durations[entity_id][prev_value] += duration
 
-                # Calculate duration in previous state (in seconds)
-                duration = (current_time - prev_time).total_seconds()
-
-                # Update duration counters
-                if entity_id not in binary_durations:
-                    binary_durations[entity_id] = {}
-
-                if prev_value not in binary_durations[entity_id]:
-                    binary_durations[entity_id][prev_value] = duration
-                else:
-                    binary_durations[entity_id][prev_value] += duration
-
-                # Update previous state and time
-                previous_states[entity_id] = value
-                previous_times[entity_id] = current_time
+                    # Update previous state and time
+                    previous_states[entity_id] = value
+                    previous_times[entity_id] = current_time
 
         # Store transitions and durations for this time window
         # Copy the counts to avoid sharing the reference
