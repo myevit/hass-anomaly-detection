@@ -1,7 +1,7 @@
 ---
 description: 
-globs: *.py
-alwaysApply: false
+globs: 
+alwaysApply: true
 ---
 
 Context-Aware Anomaly Detection for Smart Homes

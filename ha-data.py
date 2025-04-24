@@ -4,9 +4,7 @@
 # This script analyzes Home Assistant time-series data to detect anomalies
 # in smart home device behavior using machine learning techniques.
 #
-# The system uses Vowpal Wabbit for two models:
-# 1. Primary anomaly detection model using quantile regression
-# 2. Meta model that verifies anomalies using contextual information
+# The system uses Vowpal Wabbit for anomaly detection using quantile regression
 #
 # Required packages:
 # pip install influxdb-client holidays vowpalwabbit pandas numpy
@@ -17,13 +15,11 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from influxdb_client import InfluxDBClient
 import vowpalwabbit
-import pickle
 import holidays
 import warnings
 from influxdb_client.client.warnings import MissingPivotFunction
 
-# At the top, after imports
-# Import config if available
+# Import config from config.py
 try:
     import config
 
@@ -34,69 +30,16 @@ try:
     BUCKET = config.BUCKET
     MODELS_DIR = config.MODELS_DIR
     ANOMALY_MODEL_PATH = config.ANOMALY_MODEL_PATH
-    META_MODEL_PATH = config.META_MODEL_PATH
-    ANOMALY_HISTORY_PATH = config.ANOMALY_HISTORY_PATH
     CHUNK_SIZE = config.CHUNK_SIZE
     DEFAULT_DAYS = config.DEFAULT_DAYS
     ANOMALY_THRESHOLD = config.ANOMALY_THRESHOLD
-    META_ANOMALY_THRESHOLD = config.META_ANOMALY_THRESHOLD
     FORCE_RETRAIN = config.FORCE_RETRAIN
-    MAX_BINARY_STATES = config.MAX_BINARY_STATES
     print("Loaded configuration from config.py")
 except ImportError:
-    # Use default configuration
-    print("No config.py found, using default configuration")
-    # Keep existing configuration here...
+    print("No config.py found. Please create a config file with required parameters.")
+    exit(1)
 
-# Add this right after your imports
-print("Script starting, ModelInfo class will be defined soon...")
-
-
-# === DATA CLASSES ===
-class ModelInfo:
-    """
-    Class to store model metadata and anomaly history between runs.
-
-    Attributes:
-        last_cutoff (datetime): Timestamp of last processed data.
-        change_history (list): History of detected anomalies and their details.
-    """
-
-    def __init__(self, last_cutoff, change_history=None):
-        self.last_cutoff = last_cutoff
-        self.change_history = change_history or []
-
-
-# # === CONFIGURATION ===
-# # Connection parameters for InfluxDB.
-# # Connection parameters for InfluxDB.
-# INFLUX_URL = "http://192.168.1.4:8086"
-# TOKEN = "LY86Tqy1cg5-UYTYPMmHI5opIxC2_NtLiZexyHehiqmL7YLGyHOyEeosm9JXAnoVuNaZT5TYNNcMW1eQK3qW3g=="
-# ORG = "myeHome"
-# BUCKET = "home-assistant"
-
-# # Model storage paths.
-# MODELS_DIR = "models"
-# ANOMALY_MODEL_PATH = os.path.join(
-#     MODELS_DIR, "anomaly_model.vw"
-# )  # Primary anomaly detection model.
-# META_MODEL_PATH = os.path.join(
-#     MODELS_DIR, "meta_model.vw"
-# )  # Secondary verification model.
-# ANOMALY_HISTORY_PATH = os.path.join(
-#     MODELS_DIR, "anomaly_history.pkl"
-# )  # Stores history of detected anomalies.
-
-# # Data processing parameters.
-# CHUNK_SIZE = "5min"  # Time interval for aggregating data.
-# DEFAULT_DAYS = 7  # Default number of days to look back for historical data.
-
-# # Anomaly detection thresholds.
-# ANOMALY_THRESHOLD = 0.9  # Primary anomaly score threshold (0-1 scale).
-# META_ANOMALY_THRESHOLD = 0.5  # Threshold for meta model anomaly confirmation.
-
-# # Training control.
-# FORCE_RETRAIN = False  # Set to True to force model retraining from scratch.
+print("Script starting...")
 
 # === INITIALIZATION ===
 # --- Directory Setup ---
@@ -104,9 +47,8 @@ class ModelInfo:
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # --- State Initialization ---
-# Initialize last data cutoff point and change history.
+# Initialize last data cutoff point
 last_cutoff = datetime.now(timezone.utc) - timedelta(days=DEFAULT_DAYS)
-change_history = []
 
 # --- Force Retrain Logic ---
 # If force retrain is enabled, delete existing models and reset time range.
@@ -114,262 +56,41 @@ if FORCE_RETRAIN:
     print("Forcing model retraining - deleting existing models...")
     if os.path.exists(ANOMALY_MODEL_PATH):
         os.remove(ANOMALY_MODEL_PATH)
-    if os.path.exists(META_MODEL_PATH):
-        os.remove(META_MODEL_PATH)
-    if os.path.exists(ANOMALY_HISTORY_PATH):
-        os.remove(ANOMALY_HISTORY_PATH)
     # Reset last_cutoff to ensure we get enough training data.
     print(f"Resetting time range to last {DEFAULT_DAYS} days for retraining")
     # last_cutoff is already initialized above.
-else:
-    # Load existing model info if available to continue from last run.
-    try:
-        print(f"About to load pickle from {ANOMALY_HISTORY_PATH}")
-        with open(ANOMALY_HISTORY_PATH, "rb") as f:
-            print("File opened successfully")
-            raw_data = pickle.load(f)
-            print("Pickle loaded successfully")
-
-        # Create a new ModelInfo object regardless of what was loaded
-        if hasattr(raw_data, "last_cutoff") and hasattr(raw_data, "change_history"):
-            # Create fresh instance with current class definition
-            last_cutoff = raw_data.last_cutoff
-            change_history = raw_data.change_history
-        else:
-            # Handle dict format or unexpected data
-            last_cutoff = (
-                raw_data.get("last_cutoff", last_cutoff)
-                if isinstance(raw_data, dict)
-                else last_cutoff
-            )
-            change_history = (
-                raw_data.get("change_history", []) if isinstance(raw_data, dict) else []
-            )
-    except Exception as e:
-        print(f"Error loading anomaly history: {e}")
-        import traceback
-
-        traceback.print_exc()  # Print the full stack trace
 
 
-# === ANALYSIS FUNCTIONS ===
-def analyze_change_history(change_history, now):
-    """
-    Analyze anomaly history to detect patterns and provide insights.
-
-    This function performs several analyses:
-    1. Entity frequency - which entities change most often
-    2. Temporal patterns - when anomalies occur (hour/day)
-    3. Threshold recommendations - suggests optimal anomaly threshold
-    4. Recurring sequences - identifies entities that change together
-
-    Args:
-        change_history (list): List of historical anomaly records.
-        now (datetime): Current timestamp for time-based calculations.
-
-    Returns:
-        dict: Analysis results with various metrics and recommendations.
-    """
-    if not change_history:
-        return {
-            "entity_frequencies": {},
-            "hourly_patterns": {},
-            "daily_patterns": {},
-            "recommended_threshold": ANOMALY_THRESHOLD,
-            "recurring_sequences": [],
-        }
-
-    # 1. Entity frequency analysis - which entities appear most often in anomalies.
-    entity_frequencies = {}
-    for entry in change_history:
-        if "changes" not in entry:
-            continue
-        for entity in entry["changes"].keys():
-            entity_frequencies[entity] = entity_frequencies.get(entity, 0) + 1
-
-    # Sort by frequency.
-    sorted_entities = sorted(
-        entity_frequencies.items(), key=lambda x: x[1], reverse=True
-    )
-
-    # 2. Temporal patterns - when do anomalies occur most frequently.
-    hourly_patterns = {hour: 0 for hour in range(24)}
-    daily_patterns = {day: 0 for day in range(7)}
-
-    for entry in change_history:
-        if "timestamp" not in entry:
-            continue
-        ts = entry["timestamp"]
-        hourly_patterns[ts.hour] += 1
-        daily_patterns[ts.dayofweek] += 1
-
-    # 3. Calculate recommended threshold based on historical data.
-    # Uses 75th percentile of historical scores as recommended threshold.
-    scores = [entry.get("score", 0) for entry in change_history if "score" in entry]
-    if scores:
-        # Use 75th percentile of historical scores as recommended threshold.
-        scores.sort()
-        percentile_75 = scores[int(len(scores) * 0.75)]
-        recommended_threshold = round(min(max(0.3, percentile_75), 0.9), 2)
-    else:
-        recommended_threshold = ANOMALY_THRESHOLD
-
-    # 4. Find recurring sequences (pattern detection).
-    # Identifies sets of entities that frequently change together.
-    recurring_sequences = []
-    if len(change_history) > 5:
-        # Look at last 30 days of changes.
-        cutoff = now - timedelta(days=30)
-        recent_changes = [
-            entry
-            for entry in change_history
-            if "timestamp" in entry and entry["timestamp"] > cutoff
-        ]
-
-        # Extract entities that changed together frequently.
-        entity_groups = {}
-        for entry in recent_changes:
-            if "changes" not in entry:
-                continue
-
-            # Create a frozen set of changed entities for this timestamp.
-            changed_entities = frozenset(entry["changes"].keys())
-            if len(changed_entities) > 1:
-                entity_groups[changed_entities] = (
-                    entity_groups.get(changed_entities, 0) + 1
-                )
-
-        # Find groups that occur more than once.
-        for group, count in entity_groups.items():
-            if count > 1 and len(group) > 1:
-                recurring_sequences.append({"entities": list(group), "count": count})
-
-        # Sort by frequency.
-        recurring_sequences.sort(key=lambda x: x["count"], reverse=True)
-        # Keep top 5.
-        recurring_sequences = recurring_sequences[:5]
-
-    return {
-        "entity_frequencies": dict(sorted_entities[:10]),  # Top 10 entities.
-        "hourly_patterns": hourly_patterns,
-        "daily_patterns": daily_patterns,
-        "recommended_threshold": recommended_threshold,
-        "recurring_sequences": recurring_sequences,
-    }
-
-
-def print_change_history_analysis(analysis):
-    """
-    Print the analysis of change history in a human-readable format.
-
-    Shows insights about:
-    - Top anomalous entities
-    - Temporal patterns (when anomalies occur)
-    - Recommended threshold adjustments
-    - Recurring anomaly patterns
-
-    Args:
-        analysis (dict): Analysis results from analyze_change_history.
-    """
-    print("\n=== ANOMALY HISTORY ANALYSIS ===")
-
-    # 1. Frequently anomalous entities.
-    print("\n🔄 TOP ANOMALOUS ENTITIES:")
-    if analysis["entity_frequencies"]:
-        for entity, count in analysis["entity_frequencies"].items():
-            print(f"  • {entity}: {count} anomalies")
-    else:
-        print("  No entity frequency data available")
-
-    # 2. Time patterns.
-    print("\n⏰ TEMPORAL PATTERNS:")
-    # Find peak hours.
-    hourly = analysis["hourly_patterns"]
-    if sum(hourly.values()) > 0:
-        max_hourly = max(hourly.values())
-        peak_hours = [f"{h}:00" for h, v in hourly.items() if v > max_hourly * 0.7]
-        print(f"  • Peak anomaly hours: {', '.join(peak_hours)}")
-
-        # Find peak days.
-        daily = analysis["daily_patterns"]
-        max_daily = max(daily.values())
-        days = [
-            "Monday",
-            "Tuesday",
-            "Wednesday",
-            "Thursday",
-            "Friday",
-            "Saturday",
-            "Sunday",
-        ]
-        peak_days = [days[d] for d, v in daily.items() if v > max_daily * 0.7]
-        print(f"  • Peak anomaly days: {', '.join(peak_days)}")
-    else:
-        print("  No temporal pattern data available")
-
-    # 3. Threshold recommendation.
-    current = ANOMALY_THRESHOLD
-    recommended = analysis["recommended_threshold"]
-    if current != recommended:
-        print(f"\n🎯 THRESHOLD RECOMMENDATION:")
-        if recommended > current:
-            print(f"  Current threshold ({current}) may be too low")
-            print(
-                f"  Recommended threshold: {recommended} (would reduce false positives)"
-            )
-        else:
-            print(f"  Current threshold ({current}) may be too high")
-            print(
-                f"  Recommended threshold: {recommended} (would catch more anomalies)"
-            )
-
-    # 4. Recurring sequences.
-    sequences = analysis["recurring_sequences"]
-    if sequences:
-        print("\n🔁 RECURRING ANOMALY PATTERNS:")
-        for seq in sequences:
-            entities = seq["entities"]
-            if len(entities) > 3:
-                entity_str = f"{', '.join(entities[:2])} and {len(entities)-2} more"
-            else:
-                entity_str = ", ".join(entities)
-            print(f"  • {entity_str} changed together {seq['count']} times")
-
-    print("\n================================\n")
-
-
-# === DATABASE CONNECTION ===
-# Connect to InfluxDB and set up query client.
-client = InfluxDBClient(url=INFLUX_URL, token=TOKEN, org=ORG)
-query_api = client.query_api()
-
-# Suppress InfluxDB warnings about pivot functions.
-warnings.simplefilter("ignore", MissingPivotFunction)
-
-
-# === DATA PROCESSING UTILITIES ===
+# === UTILITY FUNCTIONS ===
 def clean_value(value):
     """
-    Clean a value to prevent newlines and other problematic characters.
-
-    This is important for Vowpal Wabbit format which is sensitive to newlines,
-    tabs, pipes, and colons.
-
-    Args:
-        value: The value to clean (string or other type).
-
-    Returns:
-        Cleaned value with problematic characters replaced.
+    Clean and normalize a value for VW formatting.
+    Handles nulls, empty strings, and formatting in one place.
     """
+    # Handle null/NA values first
+    if (
+        pd.isna(value)
+        or value == ""
+        or (isinstance(value, str) and value.lower() in ["nan", "none"])
+    ):
+        return "NA"
+
+    # For string values, handle problematic characters
     if isinstance(value, str):
-        # Replace newlines, tabs, etc with spaces.
+        # Replace newlines, tabs with spaces
         value = value.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-        # Replace multiple spaces with a single space.
+        # Replace multiple spaces with a single space
         while "  " in value:
             value = value.replace("  ", " ")
-        # Remove other problematic characters.
-        value = value.replace("|", "_").replace(":", "_")
-    return value
+        # Replace problematic characters for VW format
+        value = value.replace("|", "_").replace(":", "_").replace(" ", "_")
+
+    return str(value).strip()
+
+
+def is_valid_value(value):
+    """Simplified validity check that works with clean_value"""
+    return clean_value(value) != "NA"
 
 
 def format_vw_example(
@@ -384,98 +105,59 @@ def format_vw_example(
 ):
     """
     Format data as a Vowpal Wabbit example string using namespaces.
-
-    VW format uses namespaces to organize features by type:
-    - num: numeric sensor values
-    - txt: text/categorical states
-    - ctx: contextual features (time, etc.)
-    - bin: binary state transitions
-    - dur: state durations
-
-    Args:
-        timestamp: for tag and context features.
-        numeric_features: dict of sensor numeric values.
-        text_features: dict of sensor text states.
-        context_features: dict of time context features (hour, day, etc.).
-        binary_transitions: dict of transition counts for binary entities.
-        binary_durations: dict of state durations for binary entities.
-        label: optional label for training.
-        tag: optional example tag for tracking.
-
-    Returns:
-        String formatted for VW consumption.
+    Optimized for efficiency with fewer redundant operations.
     """
-    example_parts = []
+    # Initialize parts with the label (default to 1 if not provided)
+    parts = [str(label) if label is not None else "1"]
 
-    # Add label if provided (for anomaly detection, we use quantile regression).
-    if label is not None:
-        example_parts.append(f"{label}")
-
-    # Add tag if provided (for tracking examples).
+    # Add tag (use timestamp if not provided)
     if tag:
-        example_parts.append(f"'{tag}")
+        parts.append(f"'{tag}")
+    elif timestamp is not None:
+        parts.append(f"'{timestamp.isoformat()}")
 
-    # Store namespace strings.
-    ns_strings = []
+    # Define namespaces and their features in a dictionary for consistent processing
+    namespaces = {
+        "num": numeric_features or {},
+        "txt": text_features or {},
+        "bin": {},  # Will populate from binary_transitions
+        "dur": {},  # Will populate from binary_durations
+        "ctx": context_features or {},
+    }
 
-    # Add numeric features namespace.
-    if numeric_features:
-        num_parts = []
-        for name, value in numeric_features.items():
-            if pd.notna(value):
-                safe_name = clean_value(str(name))
-                num_parts.append(f"{safe_name}:{value}")
-        if num_parts:
-            ns_strings.append("|num " + " ".join(num_parts))
-
-    # Add text features namespace - let VW handle tokenization.
-    if text_features:
-        txt_parts = []
-        for name, value in text_features.items():
-            if value and pd.notna(value) and value.lower() not in ["nan", "none", ""]:
-                safe_name = clean_value(str(name))
-                safe_value = clean_value(str(value))
-                txt_parts.append(f"{safe_name}_{safe_value}")
-        if txt_parts:
-            ns_strings.append("|txt " + " ".join(txt_parts))
-
-    # Add binary state transitions namespace
+    # Pre-process binary transitions for consistent format
     if binary_transitions:
-        bin_parts = []
         for entity, count in binary_transitions.items():
             if count > 0:  # Only include entities with transitions
-                safe_name = clean_value(str(entity))
-                bin_parts.append(f"trs_{safe_name}:{count}")
-        if bin_parts:
-            ns_strings.append("|bin " + " ".join(bin_parts))
+                safe_name = clean_value(entity)
+                namespaces["bin"][f"trs_{safe_name}"] = count
 
-    # Add binary state durations namespace
+    # Pre-process binary durations for consistent format
     if binary_durations:
-        dur_parts = []
         for entity, states in binary_durations.items():
             for state, duration in states.items():
-                safe_entity = clean_value(str(entity))
-                safe_state = clean_value(str(state))
-                dur_parts.append(f"dur_{safe_entity}_{safe_state}:{duration}")
-        if dur_parts:
-            ns_strings.append("|dur " + " ".join(dur_parts))
+                safe_entity = clean_value(entity)
+                safe_state = clean_value(state)
+                namespaces["dur"][f"dur_{safe_entity}_{safe_state}"] = duration
 
-    # Add time context namespace.
-    if context_features:
-        ctx_parts = []
-        for name, value in context_features.items():
-            if pd.notna(value):
-                safe_name = clean_value(str(name))
-                ctx_parts.append(f"{safe_name}:{value}")
-        if ctx_parts:
-            ns_strings.append("|ctx " + " ".join(ctx_parts))
+    # Process each namespace consistently
+    for ns, features in namespaces.items():
+        if not features:
+            continue
 
-    # Combine namespace strings.
-    if ns_strings:
-        example_parts.extend(ns_strings)
+        ns_parts = []
+        for name, value in features.items():
+            # Use clean_value for all strings, but preserve numeric values
+            if isinstance(value, (int, float)):
+                if value != 0:  # Skip zero values as they don't add information
+                    ns_parts.append(f"{clean_value(name)}:{value}")
+            elif is_valid_value(value):
+                ns_parts.append(f"{clean_value(name)}_{clean_value(value)}")
 
-    # Join all parts with spaces.
-    return " ".join(example_parts)
+        if ns_parts:
+            parts.append(f"|{ns} {' '.join(ns_parts)}")
+
+    return " ".join(parts)
 
 
 def extract_timestamp_features(timestamp):
@@ -490,6 +172,7 @@ def extract_timestamp_features(timestamp):
     - Month (1-12)
     - Season (0-3)
     - Holiday flag (0-1)
+    - Time of day period (0-3: night, morning, afternoon, evening)
 
     Args:
         timestamp: Datetime object.
@@ -499,13 +182,28 @@ def extract_timestamp_features(timestamp):
     """
     ca_holidays = holidays.CA(prov="AB")  # Customize based on your location.
 
+    # Determine time of day period
+    hour = timestamp.hour
+    if 5 <= hour < 12:
+        time_period = 1  # Morning (5am to 11:59am)
+    elif 12 <= hour < 17:
+        time_period = 2  # Afternoon (12pm to 4:59pm)
+    elif 17 <= hour < 22:
+        time_period = 3  # Evening (5pm to 9:59pm)
+    else:
+        time_period = 0  # Night (10pm to 4:59am)
+
     features = {
-        "hour": timestamp.hour,
-        "hour_quarter": timestamp.minute
-        // 15,  # Adds 0, 1, 2, or 3 for quarter of hour.
+        "hour": hour,
+        "hour_quarter": timestamp.minute // 15,  # 0, 1, 2, or 3
         "day_of_week": timestamp.dayofweek,
         "is_weekend": int(timestamp.dayofweek >= 5),
         "month": timestamp.month,
+        "time_period": time_period,  # 0=night, 1=morning, 2=afternoon, 3=evening
+        "is_night": int(time_period == 0),
+        "is_morning": int(time_period == 1),
+        "is_afternoon": int(time_period == 2),
+        "is_evening": int(time_period == 3),
         "season": {
             12: 0,  # Winter: Dec-Feb
             1: 0,
@@ -527,55 +225,46 @@ def extract_timestamp_features(timestamp):
 
 def track_changes(current_data, previous_data, entity_cols):
     """
-    Track changes between two consecutive data points.
-
-    For each entity, compares current value to previous value and records:
-    - For numeric values: previous value, current value, and difference
-    - For text values: previous value and current value
-
-    Args:
-        current_data: Dictionary of current data point.
-        previous_data: Dictionary of previous data point.
-        entity_cols: Set of all entity IDs to compare.
-
-    Returns:
-        dict: Dictionary of changes with entity IDs as keys.
+    Track changes between two consecutive data points with optimized processing.
     """
-    if previous_data is None:
+    if not previous_data:
         return {}
 
     changes = {}
 
-    # Compare all columns.
-    for col in entity_cols:
-        if col in current_data and col in previous_data:
-            current_val = current_data[col]
-            previous_val = previous_data[col]
+    # Process only entities that exist in both datasets and have changed
+    common_cols = set(current_data) & set(previous_data) & entity_cols
 
-            # Only include if values changed and not missing.
-            if (
-                pd.notna(current_val)
-                and pd.notna(previous_val)
-                and current_val != previous_val
+    for col in common_cols:
+        current_val = current_data[col]
+        previous_val = previous_data[col]
+
+        # Skip identical values
+        if current_val == previous_val:
+            continue
+
+        # Skip invalid values (using our optimized is_valid_value)
+        if not (is_valid_value(current_val) and is_valid_value(previous_val)):
+            continue
+
+        try:
+            # Handle numeric values - add difference calculation
+            if isinstance(current_val, (int, float)) and isinstance(
+                previous_val, (int, float)
             ):
-                try:
-                    # For numeric values, calculate difference.
-                    if isinstance(current_val, (int, float)) and isinstance(
-                        previous_val, (int, float)
-                    ):
-                        changes[col] = {
-                            "previous": previous_val,
-                            "current": current_val,
-                            "diff": current_val - previous_val,
-                        }
-                    else:
-                        # For text values.
-                        changes[col] = {
-                            "previous": str(previous_val),
-                            "current": str(current_val),
-                        }
-                except Exception as e:
-                    print(f"Error calculating change for {col}: {e}")
+                changes[col] = {
+                    "previous": previous_val,
+                    "current": current_val,
+                    "diff": current_val - previous_val,
+                }
+            else:
+                # Text values - convert both to string using clean_value for consistency
+                changes[col] = {
+                    "previous": clean_value(previous_val),
+                    "current": clean_value(current_val),
+                }
+        except Exception as e:
+            print(f"Error calculating change for {col}: {e}")
 
     return changes
 
@@ -631,27 +320,13 @@ def create_anomaly_model(save_path=None):
     return vowpalwabbit.Workspace(args)
 
 
-def create_meta_model(save_path=None):
-    """
-    Create a VW model for meta decisions using binary classification.
+# === DATABASE CONNECTION ===
+# Connect to InfluxDB and set up query client.
+client = InfluxDBClient(url=INFLUX_URL, token=TOKEN, org=ORG)
+query_api = client.query_api()
 
-    This model verifies anomalies detected by the primary model.
-
-    Model settings:
-    - Logistic loss for binary classification
-    - N-gram processing for text features
-
-    Args:
-        save_path: Optional path to save model.
-
-    Returns:
-        VW model workspace.
-    """
-    args = "--loss_function logistic --binary --ngram txt:2 --bit_precision 28"
-    if save_path:
-        args += f" -f {save_path}"
-    return vowpalwabbit.Workspace(args)
-
+# Suppress InfluxDB warnings about pivot functions.
+warnings.simplefilter("ignore", MissingPivotFunction)
 
 # === MODEL INITIALIZATION ===
 # --- Create or Load Anomaly Model ---
@@ -666,19 +341,6 @@ if os.path.exists(ANOMALY_MODEL_PATH):
 else:
     # Create new model.
     anomaly_model = create_anomaly_model(ANOMALY_MODEL_PATH)
-
-# --- Create or Load Meta Model ---
-if os.path.exists(META_MODEL_PATH):
-    try:
-        # Load existing model.
-        meta_model = vowpalwabbit.Workspace(f"-i {META_MODEL_PATH}")
-    except Exception as e:
-        print(f"Error loading meta model: {e}")
-        # Fall back to creating a new model.
-        meta_model = create_meta_model(META_MODEL_PATH)
-else:
-    # Create new model.
-    meta_model = create_meta_model(META_MODEL_PATH)
 
 # === DATA RETRIEVAL ===
 # --- Find Latest Data ---
@@ -763,43 +425,13 @@ binary_durations = {}  # Duration in seconds per state for binary entities
 previous_states = {}  # Track previous state for detecting transitions
 previous_times = {}  # Track previous time for duration calculation
 
-# Dictionary to track unique states per entity
-entity_unique_states = {}
-# Maximum number of unique states to still be considered binary-like
-# Set of entities that behave like binary sensors
-binary_like_entities = set()
-
-# First pass - identify entities that behave like binary sensors
-print("Analyzing entity behavior patterns...")
+# Identify initial state for each entity
 for _, row in df.iterrows():
     entity_id = row["entity_id"]
     field_type = row["_field"]
 
-    # Only analyze text states
+    # Only consider state fields for binary state tracking
     if field_type == "state":
-        value = str(row["_value"])
-
-        # Track unique states for this entity
-        if entity_id not in entity_unique_states:
-            entity_unique_states[entity_id] = set()
-
-        entity_unique_states[entity_id].add(value)
-
-# Determine which entities behave like binary sensors
-for entity_id, states in entity_unique_states.items():
-    if len(states) <= MAX_BINARY_STATES:
-        binary_like_entities.add(entity_id)
-        print(
-            f"Entity {entity_id} behaves like a binary sensor with states: {', '.join(states)}"
-        )
-
-# Identify initial state for binary-like entities
-for _, row in df.iterrows():
-    entity_id = row["entity_id"]
-    field_type = row["_field"]
-
-    # Only consider state fields for binary-like entities
-    if field_type == "state" and entity_id in binary_like_entities:
         value = str(row["_value"])
         time = row["_time"]
 
@@ -826,12 +458,43 @@ for (timestamp, field_type), group in df_grouped:
 
     # Store data by field type.
     if field_type == "value":
-        # Process numeric values.
-        for _, row in group.iterrows():
-            entity_id = row["entity_id"]
-            value = float(row["_value"])
-            all_data[timestamp]["numeric"][entity_id] = value
+        # Process numeric values - use DataFrame operations instead of loops where possible
+        entity_groups = group.groupby("entity_id")
+
+        for entity_id, entity_data in entity_groups:
             all_entities.add(entity_id)
+            values = entity_data["_value"].astype(float).values
+            timestamps = entity_data.index.to_list()
+
+            if len(values) > 1:
+                # Calculate metrics in one pass
+                min_value = min(values)
+                max_value = max(values)
+                value_range = max_value - min_value
+
+                # Calculate time difference in seconds
+                time_diff = (max(timestamps) - min(timestamps)).total_seconds()
+                rate_of_change = value_range / time_diff if time_diff > 0 else 0.0
+
+                # Store all metrics in a single update operation
+                all_data[timestamp]["numeric"].update(
+                    {
+                        f"{entity_id}_min": min_value,
+                        f"{entity_id}_max": max_value,
+                        f"{entity_id}_range": value_range,
+                        f"{entity_id}_roc": rate_of_change,
+                    }
+                )
+            elif len(values) == 1:
+                # Just one value - store with zero change metrics in a single update
+                all_data[timestamp]["numeric"].update(
+                    {
+                        f"{entity_id}_min": values[0],
+                        f"{entity_id}_max": values[0],
+                        f"{entity_id}_range": 0.0,
+                        f"{entity_id}_roc": 0.0,
+                    }
+                )
 
     elif field_type == "state":
         # Process text states.
@@ -840,40 +503,38 @@ for (timestamp, field_type), group in df_grouped:
             value = str(row["_value"])
             current_time = row.name  # Use index which is the timestamp
 
-            # Store the text state for all entities
+            # Store the text state
             all_data[timestamp]["text"][entity_id] = value
             all_entities.add(entity_id)
 
-            # Only track transitions for binary-like entities
-            if entity_id in binary_like_entities:
-                # If we have previous state information, we can calculate transitions and durations
-                if entity_id in previous_states:
-                    prev_value = previous_states[entity_id]
-                    prev_time = previous_times[entity_id]
+            # If we have previous state information, we can calculate transitions and durations
+            if entity_id in previous_states:
+                prev_value = previous_states[entity_id]
+                prev_time = previous_times[entity_id]
 
-                    # Check if this is a state transition
-                    if value != prev_value:
-                        # Increment transition counter
-                        if entity_id in binary_transitions:
-                            binary_transitions[entity_id] += 1
-                        else:
-                            binary_transitions[entity_id] = 1
-
-                    # Calculate duration in previous state (in seconds)
-                    duration = (current_time - prev_time).total_seconds()
-
-                    # Update duration counters
-                    if entity_id not in binary_durations:
-                        binary_durations[entity_id] = {}
-
-                    if prev_value not in binary_durations[entity_id]:
-                        binary_durations[entity_id][prev_value] = duration
+                # Check if this is a state transition
+                if value != prev_value:
+                    # Increment transition counter
+                    if entity_id in binary_transitions:
+                        binary_transitions[entity_id] += 1
                     else:
-                        binary_durations[entity_id][prev_value] += duration
+                        binary_transitions[entity_id] = 1
 
-                    # Update previous state and time
-                    previous_states[entity_id] = value
-                    previous_times[entity_id] = current_time
+                # Calculate duration in previous state (in seconds)
+                duration = (current_time - prev_time).total_seconds()
+
+                # Update duration counters
+                if entity_id not in binary_durations:
+                    binary_durations[entity_id] = {}
+
+                if prev_value not in binary_durations[entity_id]:
+                    binary_durations[entity_id][prev_value] = duration
+                else:
+                    binary_durations[entity_id][prev_value] += duration
+
+                # Update previous state and time
+                previous_states[entity_id] = value
+                previous_times[entity_id] = current_time
 
         # Store transitions and durations for this time window
         # Copy the counts to avoid sharing the reference
@@ -885,13 +546,6 @@ for (timestamp, field_type), group in df_grouped:
 
 # Sort timestamps for chronological processing.
 timestamps = sorted(all_data.keys())
-
-# --- Anomaly Detection Storage ---
-# Storage for tracking anomalies and changes.
-anomalies = []
-detected_changes = []
-all_entity_changes = []
-previous_data = None
 
 # === ANOMALY DETECTION ===
 # --- Main Processing Loop ---
@@ -914,9 +568,6 @@ for i, ts in enumerate(timestamps):
             binary_durations=current_time_data["binary_durations"],
         )
 
-        # Debug info - uncomment if needed.
-        # print(f"VW Example: {vw_example[:100]}...")
-
         # --- Primary Anomaly Detection ---
         # Get anomaly score from model (higher = more anomalous).
         try:
@@ -930,39 +581,6 @@ for i, ts in enumerate(timestamps):
         # Normalize score to 0-1 range.
         normalized_score = min(1.0, max(0.0, anomaly_score))
 
-        # Debug: Print all scores to see what values we're getting.
-        # print(
-        #     f"[{format_timestamp(ts)}] Anomaly score: {normalized_score:.4f} (threshold: {ANOMALY_THRESHOLD})"
-        # )
-
-        # --- Entity Change Tracking ---
-        # Track what entities changed since previous timestamp.
-        entity_changes = {}
-        if i > 0:
-            prev_ts = timestamps[i - 1]
-            previous_data = all_data[prev_ts]
-
-            # Track numeric changes.
-            entity_changes = track_changes(
-                current_time_data["numeric"], previous_data["numeric"], all_entities
-            )
-
-            # Add text changes.
-            text_changes = track_changes(
-                current_time_data["text"], previous_data["text"], all_entities
-            )
-            entity_changes.update(text_changes)
-
-            # Add binary state transition information to the changes
-            for entity, count in current_time_data["binary_transitions"].items():
-                if count > 0 and entity in entity_changes:
-                    entity_changes[entity]["transitions"] = count
-
-            # Add duration information to the changes
-            for entity, states in current_time_data["binary_durations"].items():
-                if entity in entity_changes:
-                    entity_changes[entity]["durations"] = states
-
         # --- Anomaly Evaluation ---
         # Check if this exceeds the anomaly threshold.
         is_anomaly = normalized_score > ANOMALY_THRESHOLD
@@ -972,6 +590,34 @@ for i, ts in enumerate(timestamps):
             print(
                 f"[{format_timestamp(ts)}] Anomaly detected! Score: {normalized_score:.4f}"
             )
+
+            # --- Entity Change Tracking ---
+            # Only track what changed if this is actually an anomaly
+            entity_changes = {}
+            if i > 0:
+                prev_ts = timestamps[i - 1]
+                previous_data = all_data[prev_ts]
+
+                # Track numeric changes.
+                entity_changes = track_changes(
+                    current_time_data["numeric"], previous_data["numeric"], all_entities
+                )
+
+                # Add text changes.
+                text_changes = track_changes(
+                    current_time_data["text"], previous_data["text"], all_entities
+                )
+                entity_changes.update(text_changes)
+
+                # Add binary state transition information to the changes
+                for entity, count in current_time_data["binary_transitions"].items():
+                    if count > 0 and entity in entity_changes:
+                        entity_changes[entity]["transitions"] = count
+
+                # Add duration information to the changes
+                for entity, states in current_time_data["binary_durations"].items():
+                    if entity in entity_changes:
+                        entity_changes[entity]["durations"] = states
 
             # Print entity changes if any.
             if entity_changes:
@@ -989,42 +635,8 @@ for i, ts in enumerate(timestamps):
                         change_str += f" [durations: {durations_str}]"
                     print(f"  - {entity}: {change_str}")
 
-        # --- Meta Model Verification ---
-        # Verify anomaly with meta model.
-        if entity_changes:
-            # Format meta example as a single string.
-            meta_features_str = f"|m score:{normalized_score} change_count:{len(entity_changes)} hour:{context_features['hour']} day:{context_features['day_of_week']} weekend:{context_features['is_weekend']} |c"
-
-            # Add changed entities names as context features.
-            for entity in entity_changes:
-                # Clean entity name to avoid parsing issues.
-                safe_entity = clean_value(str(entity))
-                meta_features_str += f" {safe_entity}"
-
-                # Add transition counts for binary entities
-                if "transitions" in entity_changes[entity]:
-                    meta_features_str += f"_{entity_changes[entity]['transitions']}"
-
-            # Predict with meta model.
-            try:
-                meta_score = meta_model.predict(meta_features_str)
-                is_meta_anomaly = meta_score > META_ANOMALY_THRESHOLD
-
-                if is_meta_anomaly:
-                    print(f"[{format_timestamp(ts)}] Meta model confirms anomaly")
-
-                    # Store change details for future reference.
-                    all_entity_changes.append(
-                        {
-                            "timestamp": ts,
-                            "score": normalized_score,
-                            "meta_score": meta_score,
-                            "changes": entity_changes,
-                            "is_anomaly": is_anomaly or is_meta_anomaly,
-                        }
-                    )
-            except Exception as e:
-                print(f"Error with meta model: {e}")
+                print(f"[{format_timestamp(ts)}] Anomaly details recorded")
+                # No need to collect anomalies since we're already printing them
 
         # --- Model Training ---
         # Train the main model on this example - we always learn from all data.
@@ -1044,19 +656,6 @@ for i, ts in enumerate(timestamps):
         except Exception as e:
             print(f"Error training anomaly model: {e}")
 
-        # --- Meta Model Training ---
-        # Train the meta model if we have entity changes.
-        # Label with 1 if this is a true anomaly, -1 otherwise.
-        if entity_changes and i > 0:
-            # Use the primary anomaly detection as a label for meta model.
-            meta_label = 1 if is_anomaly else -1
-            meta_train_example = f"{meta_label} {meta_features_str}"
-
-            try:
-                meta_model.learn(meta_train_example)
-            except Exception as e:
-                print(f"Error training meta model: {e}")
-
     except Exception as e:
         print(f"[{format_timestamp(ts)}] Error processing data: {e}")
         import traceback
@@ -1064,40 +663,12 @@ for i, ts in enumerate(timestamps):
         traceback.print_exc()
 
 # === RESULTS PROCESSING ===
-# --- Update Anomaly History ---
-# Extend change history with newly detected anomalies.
-if all_entity_changes:
-    change_history.extend(all_entity_changes)
-    # No limit on history size - keeps complete record.
-
-# --- Analyze Anomaly Patterns ---
-# Analyze history for patterns and insights if we have data.
-if change_history:
-    analysis_results = analyze_change_history(change_history, stop_time)
-    print_change_history_analysis(analysis_results)
-
-    # --- Optional Auto-Tuning ---
-    # Automatically adjust threshold based on history.
-    AUTO_TUNE_THRESHOLD = False  # Set to True to enable auto-tuning.
-    if AUTO_TUNE_THRESHOLD:
-        recommended = analysis_results["recommended_threshold"]
-        if (
-            abs(ANOMALY_THRESHOLD - recommended) > 0.1
-        ):  # Only change if difference is significant.
-            print(f"Auto-tuning threshold: {ANOMALY_THRESHOLD} → {recommended}")
-            ANOMALY_THRESHOLD = recommended
-
 # --- Model Statistics ---
 # Print model statistics to verify training has occurred.
 print(
     f"Anomaly model total examples processed: {round(anomaly_model.get_weighted_examples())}"
 )
 print(f"Anomaly model total loss: {round(anomaly_model.get_sum_loss())}")
-print(
-    f"Meta model total examples processed: {round(meta_model.get_weighted_examples())}"
-)
-print(f"Meta model total loss: {round(meta_model.get_sum_loss())}")
-print(f"Anomaly history: {len(change_history)} recorded changes")
 
 # === MODEL PERSISTENCE ===
 # --- Save Anomaly Model ---
@@ -1108,22 +679,4 @@ try:
 except Exception as e:
     print(f"Error saving anomaly model: {e}")
 
-# --- Save Meta Model ---
-try:
-    # Save the trained meta model.
-    meta_model.save(META_MODEL_PATH)
-    print(f"Meta model saved to {META_MODEL_PATH}")
-except Exception as e:
-    print(f"Error saving meta model: {e}")
-
-# --- Save Anomaly History ---
-# Save current state for next run.
-anomaly_history = ModelInfo(stop_time, change_history)
-try:
-    with open(ANOMALY_HISTORY_PATH, "wb") as f:
-        pickle.dump(anomaly_history, f)
-    print(f"Anomaly history saved to {ANOMALY_HISTORY_PATH}")
-except Exception as e:
-    print(f"Error saving anomaly history: {e}")
-
-print("Models updated and saved.")
+print("Model updated and saved.")
