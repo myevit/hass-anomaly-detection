@@ -1,119 +1,101 @@
-# Home Assistant Anomaly Detection
+# Home Assistant Anomaly Detection with Autoformer
 
-This Docker-based solution provides context-aware anomaly detection for Home Assistant smart home systems, analyzing time-series data to detect abnormal patterns.
+This project provides an anomaly detection system for Home Assistant data using the Autoformer deep learning model. The system analyzes time-series data from Home Assistant and identifies potential anomalies in smart home behavior.
 
 ## Features
 
-- Monitors Home Assistant entities via InfluxDB data
-- Detects anomalies using machine learning (Vowpal Wabbit)
-- Provides context-aware detection considering time, day, season
-- Identifies recurring patterns and anomaly frequencies
-- Maintains history of detected anomalies
-- Suggests optimal threshold settings based on historical data
+- Connects to InfluxDB to retrieve Home Assistant time-series data
+- Uses Autoformer, a state-of-the-art time series forecasting model for anomaly detection
+- Considers contextual factors such as time of day, day of week, and seasonality
+- Learns patterns of normal behavior and identifies deviations
+- Provides detailed information about detected anomalies
 
-## Setup Instructions
+## Requirements
 
-### Prerequisites
+- Python 3.8 or higher
+- Home Assistant with InfluxDB integration
+- PyTorch (CPU or GPU)
 
-- Docker and Docker Compose installed on your host system
-- InfluxDB instance with Home Assistant data
-- Network access between the container and InfluxDB
+## Installation
 
-### Configuration
-
-1. Clone this repository to your server:
-   ```
-   git clone [repository-url]
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/hass-anomaly-detection.git
    cd hass-anomaly-detection
    ```
 
-2. **Important:** Create `config.py` file with your connection details:
-   ```
-   cp config.py.example config.py
-   nano config.py  # Edit with your settings
+2. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
    ```
 
-   Make sure to update these essential settings:
+3. Create a `config.py` file with your InfluxDB connection details:
    ```python
-   # Most important settings to change
-   INFLUX_URL = "http://your-influxdb-host:8086"  # Use container name if on same network
+   # Example configuration
+   INFLUX_URL = "http://your-influxdb-host:8086"
    TOKEN = "your-influxdb-token"
    ORG = "your-organization"
    BUCKET = "home-assistant"
+   
+   MODELS_DIR = "models"
+   ANOMALY_MODEL_PATH = f"{MODELS_DIR}/autoformer_model.pt"
+   
+   CHUNK_SIZE = "5min"
+   DEFAULT_DAYS = 30
+   ANOMALY_THRESHOLD = 0.7
+   FORCE_RETRAIN = False
+   
+   # Autoformer parameters
+   SEQUENCE_LENGTH = 96
+   PREDICTION_LENGTH = 24
+   TRAINING_EPOCHS = 10
+   BATCH_SIZE = 16
+   LEARNING_RATE = 0.0001
+   SIGMA_THRESHOLD = 3.0
    ```
 
-   The Docker setup REQUIRES a valid config.py file to run.
+## Usage
 
-### Building and Running
+Run the anomaly detection script:
 
-1. Build and start the container:
-   ```
-   docker-compose up -d
-   ```
+```bash
+python ha-data.py
+```
 
-2. Check logs to verify proper execution:
-   ```
-   docker-compose logs -f
-   ```
+The script will:
+1. Connect to your InfluxDB instance and retrieve Home Assistant data
+2. Process the data into time-series chunks
+3. Train the Autoformer model if no existing model is found
+4. Detect anomalies in the data and output details of any findings
+5. Save the trained model for future use
 
-3. The container will automatically restart unless explicitly stopped.
+## Understanding Anomaly Detection Results
 
-## Data Persistence
-
-The system stores model data in the `./models` directory which is mounted as a volume. This ensures that:
-
-- Trained models persist between container restarts
-- Anomaly history is maintained
-- No retraining is needed when the container restarts
-
-## Scheduling
-
-The script runs continuously within the container, processing data in incremental chunks. It will:
-
-1. Check for new data since the last run
-2. Process only if there's at least 5 minutes of new data
-3. Update models and anomaly history
-4. Wait for the next execution (15 minutes by default)
-
-## Troubleshooting
-
-- If the container stops unexpectedly, check logs with `docker-compose logs ha-anomaly`
-- Make sure config.py exists and has valid connection information
-- Verify InfluxDB connectivity from within the container
-- Ensure proper permissions on the models directory
+When an anomaly is detected, the script will output:
+- The timestamp of the anomaly
+- An anomaly score (higher values indicate stronger anomalies)
+- Details of which entities changed and how they changed
+- Duration and transition information for binary state entities
 
 ## Advanced Configuration
 
-Additional settings can be modified in the `config.py` file:
+You can adjust various parameters in the `config.py` file to customize the behavior:
 
-- `CHUNK_SIZE`: Time interval for aggregating data (default: "5min")
-- `DEFAULT_DAYS`: Default lookback period when no history exists (default: 7)
-- `ANOMALY_THRESHOLD`: Primary detection threshold (default: 0.9)
-- `FORCE_RETRAIN`: Force model retraining from scratch (default: False)
+- `SEQUENCE_LENGTH`: Length of input sequence for the model
+- `PREDICTION_LENGTH`: Length of prediction sequence
+- `ANOMALY_THRESHOLD`: Threshold for considering an observation anomalous (0-1)
+- `TRAINING_EPOCHS`: Number of training epochs
+- `SIGMA_THRESHOLD`: Number of standard deviations for anomaly threshold
 
-You can also adjust Docker-specific settings in docker-compose.yml:
-- `LOOP_INTERVAL`: Time between script executions in seconds (default: 900)
-- `SLEEP_AFTER_ERROR`: Time to wait after an error before retry (default: 300)
+## How It Works
 
-TODO:
+The system uses Autoformer, a transformer-based model designed specifically for time series forecasting. Autoformer combines auto-correlation mechanisms with a deep decomposition architecture to effectively model time series data.
 
-Chunking Improvements
-Variable window sizes: While your 5-minute chunking provides a good baseline, consider implementing multiple time windows (5-min, 1-hour, 24-hour) to detect anomalies at different scales. This helps catch both rapid fluctuations and slow pattern changes.
-
-Model Improvements
-Implement forecasting: Add time series forecasting to predict expected values and calculate anomaly scores based on deviations from predictions.
-Semi-supervised approach: Your Home Assistant system naturally has long periods of "normal" behavior - use this to your advantage with a semi-supervised model that learns normal patterns.
-
-Threshold Optimization
-Dynamic thresholds: Your fixed threshold of 0.9 is likely too high. Implement adaptive thresholds that vary by:
-Time of day (what's normal at 3PM differs from 3AM)
-Day of week
-Device type (temperature sensors vs. motion detectors)
-
-Feature Engineering
-Context-aware features: Add more contextual features like:
-Correlation between devices (example: bathroom light + bathroom motion sensor)
-Sequences of activations (example: front door → hallway motion → living room light)
-External data (example: weather, sunrise/sunset times)
+For anomaly detection, the system:
+1. Processes raw Home Assistant data into feature vectors
+2. Trains the Autoformer model on these sequences
+3. Uses the trained model to predict expected values
+4. Calculates anomaly scores based on the difference between actual and predicted values
+5. Flags time points that exceed the anomaly threshold
 
 https://victoriametrics.com/blog/victoriametrics-anomaly-detection-handbook-chapter-3/

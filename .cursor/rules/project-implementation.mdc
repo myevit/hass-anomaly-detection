@@ -1,0 +1,73 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Home Assistant Anomaly Detection Implementation
+
+This project implements a context-aware anomaly detection system for smart homes that integrates with Home Assistant. The system analyzes time-series data to detect unusual patterns in device behavior by considering contextual factors.
+
+## Architecture Overview
+
+The implementation follows this architecture:
+- **Data Source**: Home Assistant time-series data stored in InfluxDB
+- **Data Processing**: Python-based preprocessing and feature extraction
+- **Machine Learning**: Autoformer model for time-series anomaly detection
+- **Contextual Analysis**: Time, day, season, and other environmental factors
+
+## Core Files
+- [ad.py](mdc:ad.py) Main script that handles data retrieval, processing, and anomaly detection
+- [autoformer_model.py](mdc:autoformer_model.py): Contains the Autoformer model implementation for anomaly detection
+- [config.py](mdc:config.py): Configuration settings for the application
+
+## Implementation Process
+
+1. **Data Collection**
+   - Connect to InfluxDB using the InfluxDBClient
+   - Query Home Assistant state and value data
+   - Process data in 5-minute time chunks based on configured chunk size
+   - Do not use pivot option in InfluxDB query. Pivot in python code.
+   - If the request query time window more the a day. Split queries to no more than a day 
+
+2. **Feature Engineering**
+   - Extract numeric features from sensor values
+     - Compute rate of change within the time chunks by finding the difference between maximum and minimum values within each 5-minute chunk
+   - Process binary sensors
+     - Count state changes within each 5-minute chunk
+     - Calculate average time between state changes
+   - Use text values as contextual information
+   - Extract contextual features (time of day, day of week, season, etc.)
+   - Combine features into normalized feature vectors
+
+3. **Anomaly Detection**
+   - Use Autoformer model with sequence-to-sequence architecture
+   - Analyze time-series patterns to detect deviations
+   - Apply threshold-based scoring to identify anomalies
+   - Track entity changes during anomalous periods
+
+4. **Model Training**
+   - Train the model on collected data
+   - Continuous learning to adapt to changing household routines
+   - Save model state for future use
+   - Option to force retrain when needed
+
+## Anomaly Evaluation
+
+The system evaluates whether situations are anomalous by:
+- Comparing predicted values with actual values
+- Considering contextual factors (time, day, season)
+- Tracking state transitions and durations
+- Using statistical thresholds to flag unusual patterns
+
+This implementation enables detection of anomalies like:
+- Unusual device state changes at odd hours
+- Unexpected energy consumption patterns
+- Devices running in conflicting states
+- Doors/windows left open at inappropriate times
+
+The system continuously improves as it collects more data about normal household patterns.
+
+
+
+
+IMPORTANT: Update this rule file as we change approach

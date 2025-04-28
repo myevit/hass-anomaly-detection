@@ -3,11 +3,6 @@ description:
 globs: 
 alwaysApply: true
 ---
-
-Context-Aware Anomaly Detection for Smart Homes
-
-Description:
-
 This project aims to develop an intelligent anomaly detection system tailored for smart home environments. By leveraging historical data from Home Assistant, the system will learn typical household behaviors and identify deviations that may indicate anomalies.
 
 Key Features:
