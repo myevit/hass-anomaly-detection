@@ -18,7 +18,6 @@ import torch
 import holidays
 import warnings
 from influxdb_client.client.warnings import MissingPivotFunction
-from autoformer_model import AnomalyDetector
 
 # Import config from config.py
 try:
@@ -977,10 +976,7 @@ def process_and_train_chunk(chunk_df):
         (
             chunk_data,
             chunk_entities,
-            previous_states,
-            previous_times,
-            binary_transitions,
-            binary_durations,
+
         ) = process_data_chunk(chunk_df)
 
         # Detect anomalies
@@ -1170,12 +1166,6 @@ def process_data_range(start_time, end_time):
 
     print(f"Processing {total_days:.2f} days of data")
 
-    # Initialize state tracking variables that will persist across chunks
-    previous_states = {}
-    previous_times = {}
-    binary_transitions = {}
-    binary_durations = {}
-    all_processed_data = []
 
     # Process one day at a time
     current_start = start_time
@@ -1191,18 +1181,13 @@ def process_data_range(start_time, end_time):
         )
 
         # Query data for this day
-        day_data = query_day_from_influxdb(current_start, current_end)
+        data = query_day_from_influxdb(current_start, current_end)
 
-        if not day_data.empty:
+        if not data.empty:
             # Process this day's data
             try:
-                process_day(
-                    day_data,
-                    previous_states,
-                    previous_times,
-                    binary_transitions,
-                    binary_durations,
-                    all_processed_data,
+                train_model(data)
+
                 )
                 print(f"Completed processing day {day_count}")
             except Exception as e:
@@ -1296,73 +1281,8 @@ def query_day_from_influxdb(start_time, end_time):
         return pd.DataFrame()
 
 
-def process_day(
-    day_data,
-    previous_states,
-    previous_times,
-    binary_transitions,
-    binary_durations,
-    all_processed_data,
-):
-    """
-    Process a single day's data, detect anomalies, and train the model.
-
-    Args:
-        day_data: DataFrame containing the day's data
-        previous_states: Dictionary of previous states (persisted across days)
-        previous_times: Dictionary of previous times (persisted across days)
-        binary_transitions: Dictionary of transition counts (persisted across days)
-        binary_durations: Dictionary of durations (persisted across days)
-        all_processed_data: List of processed data (persisted across days)
-    """
-    global anomaly_model
-
-    # Process this day's data
-    (
-        chunk_data,
-        chunk_entities,
-        new_states,
-        new_times,
-        new_transitions,
-        new_durations,
-    ) = process_data_chunk(
-        day_data,
-        previous_states=previous_states,
-        previous_times=previous_times,
-        binary_transitions=binary_transitions,
-        binary_durations=binary_durations,
-    )
-
-    # Update the state tracking variables for the next day
-    previous_states.update(new_states)
-    previous_times.update(new_times)
-    binary_transitions.update(new_transitions)
-    binary_durations.update(new_durations)
-
-    if not chunk_data:
-        print("No data to process after chunking")
-        return
-
-    # Detect anomalies
-    day_processed_data, feature_names, anomalies = detect_anomalies(
-        chunk_data, chunk_entities, anomaly_model, processed_data=all_processed_data
-    )
-
-    # Update all_processed_data with this day's processed data
-    all_processed_data.clear()
-    all_processed_data.extend(day_processed_data)
-
-    # Train the model with all processed data
-    if len(all_processed_data) > SEQUENCE_LENGTH + PREDICTION_LENGTH:
-        print(f"Training model with {len(all_processed_data)} data points")
-        anomaly_model = train_model_with_data(
-            all_processed_data, anomaly_model, save_path=ANOMALY_MODEL_PATH
-        )
-        print(f"Model training complete. Detected {len(anomalies)} anomalies.")
-    else:
-        print(
-            f"Not enough data points for training: {len(all_processed_data)} (need {SEQUENCE_LENGTH + PREDICTION_LENGTH})"
-        )
+def train_model():
+    pass
 
 
 # Call the main function if this script is run directly
