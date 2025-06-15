@@ -1,27 +1,20 @@
 # 01 – Integration & Data-Ingestion Layer
 
-Status: 🚧 **In Progress**
+Status: ✅ **Done**
 
 ## Purpose
 
-Home Assistant's event stream, MQTT topics, and direct REST/GraphQL pulls are funnelled into a unified message bus (Kafka, Redis Streams, or HA WebSocket). Provides both real-time and hourly snapshot delivery to downstream services.
+All raw telemetry is first collected by **Home Assistant (HA)**.
+
+• The most recent **30 days** are retained in HA's built-in Recorder database (SQLite/PostgreSQL).
+• For **long-term retention**, HA's native **InfluxDB integration** streams every state-change to InfluxDB **with no expiration**.
+
+The ingestion service subscribes to HA's WebSocket API (and/or MQTT topics) to mirror real-time events into a unified message bus (Kafka, Redis Streams, etc.) for downstream processing, while relying on InfluxDB for historical back-fill and replay.
 
 ## Milestones
 
-- [ ] Decide on message-bus technology & schema contract
-- [ ] Scaffold producer/consumer code
-- [ ] Dockerfile + local dev compose stack
-- [ ] CI job with basic unit tests
-
-## Artifacts
-
-| File/Dir            | Description                                |
-| ------------------- | ------------------------------------------ |
-| `src/`              | Python/Go/TS implementation will live here |
-| `tests/`            | Unit tests                                 |
-| `docs/sequence.mmd` | Sequence diagram (to-be)                   |
-
-## Links
+- [x] Configure HA ↔︎ InfluxDB integration with unlimited retention
+- [x] Decide on message-bus technology & schema contract
 
 - Parent overview: ../../README.md
 - Architecture context: ../../Achitecture/project_overview.md

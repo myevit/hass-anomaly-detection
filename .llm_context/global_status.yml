@@ -1,4 +1,6 @@
-current_focus: 01_ingestion
-completed: []
-upcoming:
+current_focus: 03_feature_engineering
+completed:
+  - 01_ingestion
   - 02_time_series_store
+upcoming:
+  - 04_anomaly_detection
